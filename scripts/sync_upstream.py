@@ -326,8 +326,9 @@ function resolveMedia(rel){if(!rel||typeof rel!=='string')return rel;var clean=r
 window.addEventListener('error',function(ev){var el=ev.target;if(!el||!el.tagName)return;var tag=el.tagName.toUpperCase();if(tag!=='AUDIO'&&tag!=='SOURCE'&&tag!=='IMG')return;var cur=el.getAttribute('src')||el.src||'';var m=cur.match(/(?:shengcang-sound-library@main\\/|\\/)((?:audio|images)\\/[^?#]+)/);if(!m)return;var clean=m[1];var step=parseInt(el.getAttribute('data-jt-fb')||'0',10);var cands=IS_GH?[CDNS[1]+clean,BASE+clean]:[CDNS[0]+clean,CDNS[1]+clean];if(step<cands.length){el.setAttribute('data-jt-fb',String(step+1));el.src=cands[step];if(tag==='AUDIO'&&typeof el.load==='function')el.load();}},true);
 document.addEventListener('click',function(ev){var a=ev.target&&ev.target.closest?ev.target.closest('a'):null;if(!a)return;var hr=a.getAttribute('href')||'';if(hr.indexOf('signin-with-chatgpt')!==-1){ev.preventDefault();return;}if(/^\\/(audio|images)\\//.test(hr)){a.setAttribute('href',resolveMedia(hr));}},true);
 var _dbPromise=null;var origFetch=window.fetch.bind(window);window.__jtOrigFetch=origFetch;
-function getSoundsDB(){if(_dbPromise)return _dbPromise;var cb='?t='+Math.floor(Date.now()/300000);var urls=IS_GH?[CDNS[0]+'data/sounds.json'+cb,CDNS[1]+'data/sounds.json'+cb,BASE+'data/sounds.json'+cb]:[BASE+'data/sounds.json'+cb,CDNS[0]+'data/sounds.json'+cb];_dbPromise=(async function(){for(var i=0;i<urls.length;i++){try{var r=await origFetch(urls[i]);if(r.ok){var d=await r.json();var arr=Array.isArray(d)?d:(d.sounds||[]);arr.forEach(function(it){if(it.src)it.src=resolveMedia(it.src);if(Array.isArray(it.variants))it.variants.forEach(function(v){if(v&&v.src)v.src=resolveMedia(v.src);});});return Array.isArray(d)?{sounds:arr,raw:arr}:{sounds:arr,raw:d};}}catch(e){}}return {sounds:[],raw:{sounds:[]}};})();return _dbPromise;}
-window.fetch=async function(input,init){var urlStr=typeof input==='string'?input:(input&&input.url?input.url:String(input));var u;try{u=new URL(urlStr,location.origin);}catch(e){return origFetch(input,init);}var p=u.pathname;var idxApi=p.indexOf('/api/sounds');if(idxApi!==-1){var method=((init&&init.method)||(input&&input.method)||'GET').toUpperCase();if(method!=='GET')return new Response(JSON.stringify({error:'国内直连只读镜像节点'}),{status:400,headers:{'Content-Type':'application/json;charset=utf-8'}});if(u.searchParams.get('community')==='1')return new Response(JSON.stringify({sounds:[]}),{status:200,headers:{'Content-Type':'application/json;charset=utf-8'}});var db=await getSoundsDB();var after=p.slice(idxApi+'/api/sounds'.length);if(after&&after!=='/'){var sid=decodeURIComponent(after.replace(/^\\//,''));var found=db.sounds.find(function(x){return String(x.id)===sid;});if(found)return new Response(JSON.stringify(found),{status:200,headers:{'Content-Type':'application/json;charset=utf-8'}});return new Response(JSON.stringify({error:'Not found'}),{status:404,headers:{'Content-Type':'application/json;charset=utf-8'}});}return new Response(JSON.stringify(db.raw),{status:200,headers:{'Content-Type':'application/json;charset=utf-8'}});}if(/^\\/(audio|images)\\//.test(p)&&u.origin===location.origin)return origFetch(resolveMedia(p),init);return origFetch(input,init);};
+async function getJSON(path){var cb='?t='+Math.floor(Date.now()/300000);var urls=[BASE+path+cb,CDNS[0]+path+cb,CDNS[1]+path+cb];for(var i=0;i<urls.length;i++){try{var r=await origFetch(urls[i]);if(r.ok)return await r.json();}catch(e){}}throw Error('Mirror data unavailable: '+path);}
+function getSoundsDB(){if(_dbPromise)return _dbPromise;_dbPromise=(async function(){try{var manifest=await getJSON('data/manifest.json');var parts=await Promise.all(manifest.files.map(getJSON));var arr=parts.flat();if(arr.length!==manifest.sounds_count)throw Error('Incomplete mirror catalogue');arr.forEach(function(it){if(it.src)it.src=resolveMedia(it.src);if(Array.isArray(it.variants))it.variants.forEach(function(v){if(v&&v.src)v.src=resolveMedia(v.src);});});return {sounds:arr,raw:{sounds:arr,total:arr.length}};}catch(e){return {sounds:[],raw:{sounds:[],total:0}};}})();return _dbPromise;}
+window.fetch=async function(input,init){var urlStr=typeof input==='string'?input:(input&&input.url?input.url:String(input));var u;try{u=new URL(urlStr,location.origin);}catch(e){return origFetch(input,init);}var p=u.pathname;var idxApi=p.indexOf('/api/sounds');if(idxApi!==-1){var method=((init&&init.method)||(input&&input.method)||'GET').toUpperCase();if(method!=='GET')return new Response(JSON.stringify({error:'国内直连只读镜像节点'}),{status:400,headers:{'Content-Type':'application/json;charset=utf-8'}});if(u.searchParams.get('community')==='1')return new Response(JSON.stringify({sounds:[]}),{status:200,headers:{'Content-Type':'application/json;charset=utf-8'}});var db=await getSoundsDB();var after=p.slice(idxApi+'/api/sounds'.length);if(after&&after!=='/'){var sid=decodeURIComponent(after.replace(/^\\//,''));var found=db.sounds.find(function(x){return String(x.id)===sid;});if(found)return new Response(JSON.stringify(found),{status:200,headers:{'Content-Type':'application/json;charset=utf-8'}});return new Response(JSON.stringify({error:'Not found'}),{status:404,headers:{'Content-Type':'application/json;charset=utf-8'}});}return {ok:true,status:200,json:async function(){return db.raw;}};}if(/^\\/(audio|images)\\//.test(p)&&u.origin===location.origin)return origFetch(resolveMedia(p),init);return origFetch(input,init);};
 })();</script>"""
 
 
@@ -340,7 +341,48 @@ def sync_shengcang(site_dir: Path, auto_push: bool = True) -> dict:
 
     clean_html = strip_cf_challenge(b_h.decode("utf-8"))
     api_data = json.loads(b_a.decode("utf-8"))
-    norm_sounds = json.dumps(api_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    items = api_data["sounds"]
+    total = api_data["total"]
+    offsets = range(api_data["nextOffset"], total, len(items))
+
+    def fetch_page(offset):
+        url = base + "/api/sounds?limit=200&offset=" + str(offset)
+        status, body = fetch_bytes(url, retries=4)
+        if status != 200:
+            raise RuntimeError(f"Sound catalogue page {offset} returned HTTP {status}")
+        page = json.loads(body.decode("utf-8"))
+        if page.get("offset") != offset:
+            raise RuntimeError(f"Sound catalogue page {offset} has an unexpected offset")
+        return offset, page["sounds"], page["total"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        pages = sorted(ex.map(fetch_page, offsets))
+    for offset, page, reported_total in pages:
+        if len(items) != offset or not page:
+            raise RuntimeError(f"Incomplete sound catalogue at offset {offset}")
+        items.extend(page)
+    while len(items) < max(total, *(reported for _, _, reported in pages)):
+        offset, page, reported_total = fetch_page(len(items))
+        if not page:
+            raise RuntimeError(f"Incomplete sound catalogue at offset {offset}")
+        items.extend(page)
+        total = max(total, reported_total)
+    total = len(items)
+    if len({it["id"] for it in items}) != total:
+        raise RuntimeError("Incomplete or duplicate sound catalogue")
+
+    # GitHub Pages cannot host the large R2 audio collection. Keep files already
+    # present in this mirror and link newer catalogue entries to their source.
+    local_audio = {"/" + p.relative_to(site_dir).as_posix() for p in (site_dir / "audio").glob("*") if p.is_file()}
+    for it in items:
+        if it.get("src", "").startswith("/api/audio/") or (it.get("src", "").startswith("/audio/") and it["src"] not in local_audio):
+            it["src"] = base + it["src"]
+        for variant in it.get("variants") or []:
+            if variant.get("src", "").startswith("/api/audio/") or (variant.get("src", "").startswith("/audio/") and variant["src"] not in local_audio):
+                variant["src"] = base + variant["src"]
+    chunks = [items[i:i + 2000] for i in range(0, total, 2000)]
+    chunk_bytes = [json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8") for chunk in chunks]
+    norm_sounds = b"".join(chunk_bytes)
     fp = sha256_bytes(clean_html.encode("utf-8") + b"|" + norm_sounds)
 
     state_p = site_dir / ".sync_state.json"
@@ -352,31 +394,16 @@ def sync_shengcang(site_dir: Path, auto_push: bool = True) -> dict:
             pass
 
     discover_and_download_vinext_assets(base, clean_html, site_dir)
-    (site_dir / "data").mkdir(parents=True, exist_ok=True)
-    (site_dir / "data" / "sounds.json").write_bytes(norm_sounds)
-
-    items = api_data["sounds"] if isinstance(api_data, dict) and "sounds" in api_data else api_data
-    audio_paths = set()
-    for it in items:
-        if it.get("src"):
-            audio_paths.add(it["src"])
-        for v in (it.get("variants") or []):
-            if isinstance(v, dict) and v.get("src"):
-                audio_paths.add(v["src"])
-
-    def dl_aud(ap):
-        lp = site_dir / ap.lstrip("/")
-        if lp.is_file() and lp.stat().st_size > 100:
-            return True
-        lp.parent.mkdir(parents=True, exist_ok=True)
-        s, b = fetch_bytes(base + urllib.parse.quote(ap, safe="/"), retries=4, timeout=40)
-        if s == 200 and b:
-            lp.write_bytes(b)
-            return True
-        return False
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
-        list(ex.map(dl_aud, sorted(audio_paths)))
+    data_dir = site_dir / "data"
+    chunks_dir = data_dir / "sounds"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    files = []
+    for i, body in enumerate(chunk_bytes):
+        name = f"{i:03d}.json"
+        (chunks_dir / name).write_bytes(body)
+        files.append("data/sounds/" + name)
+    (data_dir / "sounds.json").unlink(missing_ok=True)
+    (data_dir / "manifest.json").write_text(json.dumps({"sounds_count": total, "files": files}), encoding="utf-8")
 
     final_html = rewrite_vinext_html(clean_html, make_gate_script("金泰 AI · 声仓（影视声音素材库）"), SC_SHIM)
     (site_dir / "index.html").write_bytes(final_html.encode("utf-8"))
