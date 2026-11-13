@@ -347,6 +347,7 @@ def git_push_if_changed(repo_dir: Path, repo_name: str, msg: str, auto_push: boo
 # 1. Shengcang Incremental Sync
 # ------------------------------------------------------------------------------
 SHIM_REV = "20261113d1"
+ZH_SHIM_REV = "20261113e4"
 SC_SHIM = """<style>a[href*="signin-with-chatgpt"]{display:none!important}</style><script id="jintai-shengcang-shim">(function(){
 var BASE=new URL('.',location.href).pathname;if(BASE.slice(-1)!=='/')BASE+='/';window.__JT_BASE__=BASE;
 var IS_GH=/github\\.io$/i.test(location.hostname||'');
@@ -596,6 +597,35 @@ if(typeof window.fetch==='function'){
 }
 var FALLBACK_SVG='data:image/svg+xml;utf8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="480" height="360" viewBox="0 0 480 360"><rect width="480" height="360" fill="#f3efe6"/><rect x="16" y="16" width="448" height="328" fill="none" stroke="#c8bda8" stroke-width="1.5"/><text x="240" y="168" text-anchor="middle" fill="#5c5040" font-family="Microsoft YaHei,sans-serif" font-size="18">馆藏文物考证条目</text><text x="240" y="202" text-anchor="middle" fill="#8b7d6b" font-family="Microsoft YaHei,sans-serif" font-size="14">点击卡片查阅馆方详细著录与原图出处</text></svg>');
 var _extMap=null;
+function toDomesticSafeImg(u){
+  if(!u||typeof u!=='string')return u;
+  if(/^https?:\\/\\/(?:[^/]+\\.)?(?:clevelandart\\.org|artic\\.edu|si\\.edu|wikimedia\\.org|wikipedia\\.org|metmuseum\\.org)\\//i.test(u)){
+    return 'https://wsrv.nl/?url='+encodeURIComponent(u)+'&w=960&output=webp';
+  }
+  return u;
+}
+function sanitizePack(pack){
+  try{
+    if(!pack||!Array.isArray(pack.records)||pack.__jtSanitized)return;
+    pack.__jtSanitized=true;
+    pack.records.forEach(function(r){
+      if(!r)return;
+      var orig=r.imageUrl||r.originalImageUrl;
+      if(!orig)return;
+      if(typeof r.previewUrl==='string'&&/^research-[A-Za-z0-9_-]+\\//.test(r.previewUrl))r.previewUrl=toDomesticSafeImg(orig);
+      if(typeof r.localImage==='string'&&/^research-[A-Za-z0-9_-]+\\//.test(r.localImage))r.localImage=toDomesticSafeImg(orig);
+      if(typeof r.thumbnailUrl==='string'&&/^research-[A-Za-z0-9_-]+\\//.test(r.thumbnailUrl))r.thumbnailUrl=toDomesticSafeImg(orig);
+    });
+  }catch(e){}
+}
+['ARCHIVE_DATA','SHANG_DATA','WESTERN_ZHOU_DATA','SPRING_AUTUMN_DATA','WARRING_STATES_DATA','QIN_DATA','WESTERN_HAN_DATA','EASTERN_HAN_DATA','WEIJIN_DATA','SUI_DATA','SONG_DATA','LIAO_DATA','JIN_DATA'].forEach(function(dk){
+  var _v=window[dk];if(_v)sanitizePack(_v);
+  try{Object.defineProperty(window,dk,{configurable:true,enumerable:true,get:function(){return _v;},set:function(nv){_v=nv;sanitizePack(nv);}});}catch(e){}
+});
+function sanitizeUnhostedPreviews(){
+  try{Object.keys(window).forEach(function(wk){if(wk==='ARCHIVE_DATA'||/_DATA$/.test(wk))sanitizePack(window[wk]);});}catch(e){}
+}
+document.addEventListener('DOMContentLoaded',sanitizeUnhostedPreviews);
 function findOrigUrlByPreview(relPath){
   if(!_extMap){
     _extMap={};
@@ -604,7 +634,8 @@ function findOrigUrlByPreview(relPath){
       if(window.ARCHIVE_DATA&&Array.isArray(window.ARCHIVE_DATA.records))pools.push(window.ARCHIVE_DATA.records);
       if(Array.isArray(window.EXPANSION_CANDIDATES))pools.push(window.EXPANSION_CANDIDATES);
       if(window.EXPANSION_CANDIDATES&&Array.isArray(window.EXPANSION_CANDIDATES.items))pools.push(window.EXPANSION_CANDIDATES.items);
-      pools.forEach(function(arr){arr.forEach(function(r){if(!r)return;var k=r.localImage||r.previewUrl;var u=r.imageUrl||r.originalImageUrl;if(k&&u)_extMap[k.replace(/^\\.\\//,'')]=u;});});
+      Object.keys(window).forEach(function(wk){if(/_DATA$/.test(wk)&&window[wk]&&Array.isArray(window[wk].records))pools.push(window[wk].records);});
+      pools.forEach(function(arr){arr.forEach(function(r){if(!r)return;var u=r.imageUrl||r.originalImageUrl;if(!u)return;[r.localImage,r.previewUrl].forEach(function(k){if(k)_extMap[String(k).replace(/^\\.\\//,'')]=u;});});});
     }catch(e){}
   }
   return _extMap[relPath]||'';
@@ -615,7 +646,7 @@ window.addEventListener('error',function(ev){
   var step=parseInt(el.getAttribute('data-jt-fb')||'0',10);
   if(step>=4){el.src=FALLBACK_SVG;return;}
   el.setAttribute('data-jt-fb',String(step+1));
-  var mRel=cur.match(/((?:assets|images)\\/[^?#]+)/);
+  var mRel=cur.match(/((?:assets|(?:[A-Za-z0-9_-]+-)?images|research-[A-Za-z0-9_-]+)\\/[^?#]+)/);
   if(mRel&&cur.indexOf('wsrv.nl')===-1){
     var rel=mRel[1];
     if(IS_GH&&step===0){el.src=RAW+rel;return;}
@@ -653,6 +684,13 @@ def norm_zh_rel(base_doc: str, raw_ref: str):
 def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
     git_prepare_repo(site_dir, auto_push)
     host = "zhonghua-civilization-atlas.fondcream1.chatgpt.site"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(f"https://{host}/", headers={"User-Agent": UA}), timeout=15) as r_eff:
+            eff_netloc = urllib.parse.urlparse(r_eff.geturl()).netloc
+            if eff_netloc:
+                host = eff_netloc
+    except Exception:
+        pass
     base = f"https://{host}/"
 
     # Quick probe on index.html + data.js + daily-batch.js + app.js
@@ -666,7 +704,7 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
             if pf.endswith(".html"):
                 b_p = strip_cf_challenge(b_p.decode("utf-8", "ignore")).encode("utf-8")
             probe_parts.append(sha256_bytes(b_p))
-    quick_fp = "|".join(probe_parts + [SHIM_REV])
+    quick_fp = "|".join(probe_parts + [ZH_SHIM_REV])
 
     state_p = site_dir / ".sync_state.json"
     required_aux = (
@@ -749,7 +787,7 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
                         if nr:
                             discovered_media.add(nr)
                 elif ext in (".js", ".json"):
-                    for m in re.finditer(r'["\'`]((?:\./)?(?:assets|images|research-[A-Za-z0-9_-]+)/[^"\'`\s?#]+|(?:[A-Za-z0-9_-]+\.html))(?:\?[^"\'`\s#]*)?["\'`]', txt):
+                    for m in re.finditer(r'["\'`]((?:\./)?(?:assets|(?:[A-Za-z0-9_-]+-)?images|research-[A-Za-z0-9_-]+)/[^"\'`\s?#]+|(?:[A-Za-z0-9_-]+\.html))(?:\?[^"\'`\s#]*)?["\'`]', txt):
                         nr = norm_zh_rel(rel, m.group(1))
                         if nr:
                             rext = os.path.splitext(nr)[1].lower()
@@ -758,10 +796,18 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
                             elif rext in asset_exts:
                                 discovered_media.add(nr)
 
-    missing_media = sorted(m for m in discovered_media if not (site_dir / m).is_file())
+    prev_unhosted = set()
+    if state_p.is_file():
+        try:
+            prev_unhosted = set(json.loads(state_p.read_text(encoding="utf-8")).get("unhosted_media") or [])
+        except Exception:
+            pass
+    missing_media = sorted(m for m in discovered_media if not (site_dir / m).is_file() and m not in prev_unhosted)
+    newly_unhosted = set()
     if missing_media:
         tls_local = threading.local()
         ctx = ssl.create_default_context()
+        unhosted_lock = threading.Lock()
         def dl_media(rel):
             conn = getattr(tls_local, "conn", None)
             for _ in range(2):
@@ -772,10 +818,25 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
                     conn.request("GET", "/" + urllib.parse.quote(rel, safe="/"), headers={"User-Agent": UA, "Connection": "keep-alive"})
                     resp = conn.getresponse()
                     data = resp.read()
+                    if resp.status in (301, 302, 307, 308):
+                        loc = resp.getheader("Location") or ""
+                        if loc.startswith("http"):
+                            st_r, data_r = fetch_bytes(loc, retries=2, timeout=15)
+                            if st_r == 200 and data_r and len(data_r) < 25 * 1024 * 1024:
+                                lp = site_dir / rel
+                                lp.parent.mkdir(parents=True, exist_ok=True)
+                                lp.write_bytes(data_r)
+                            elif st_r in (404, 410):
+                                with unhosted_lock:
+                                    newly_unhosted.add(rel)
+                        return
                     if resp.status == 200 and data and len(data) < 25 * 1024 * 1024:
                         lp = site_dir / rel
                         lp.parent.mkdir(parents=True, exist_ok=True)
                         lp.write_bytes(data)
+                    elif resp.status in (404, 410):
+                        with unhosted_lock:
+                            newly_unhosted.add(rel)
                     return
                 except Exception:
                     tls_local.conn = None
@@ -804,7 +865,8 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
         except Exception:
             pass
 
-    state_p.write_text(json.dumps({"quick_fp": quick_fp, "docs": len(visited), "new_media": len(missing_media)}, indent=2), encoding="utf-8")
+    all_unhosted = sorted((prev_unhosted | newly_unhosted) - {m for m in discovered_media if (site_dir / m).is_file()})
+    state_p.write_text(json.dumps({"quick_fp": quick_fp, "docs": len(visited), "new_media": len(missing_media) - len(newly_unhosted), "unhosted_media": all_unhosted}, indent=2), encoding="utf-8")
     changed = git_push_if_changed(site_dir, "zhonghua-civilization-atlas", f"sync(auto): upstream zhonghua atlas ({len(visited)} docs)", auto_push)
     return {"site": "zhonghua", "status": "updated" if changed else "up-to-date", "changed_files": len(changed), "new_media": len(missing_media)}
 
