@@ -2,6 +2,7 @@
 """Apply the sound-finding UI to every upstream mirror refresh."""
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -31,7 +32,31 @@ def replace_one(source: str, old: str, new: str, name: str) -> str:
     return source.replace(old, new, 1)
 
 
-def patch_bundle(source: str) -> str:
+def collect_missing_audio(site: Path) -> list[str]:
+    manifest = next(
+        (data for file in site.glob("catalogue-*.json")
+         if isinstance((data := json.loads(file.read_text(encoding="utf-8"))), dict)
+         and isinstance(data.get("parts"), list)),
+        None,
+    )
+    if manifest is None:
+        raise RuntimeError("catalogue manifest missing")
+    missing: set[str] = set()
+    for part in manifest["parts"]:
+        data = json.loads((site / part["url"].lstrip("./")).read_text(encoding="utf-8"))
+        column = data["columns"].index("src")
+        dictionary = data["dictionary"]
+        for row in data["rows"]:
+            value = row[column]
+            src = dictionary[value] if isinstance(value, int) else value
+            if src.startswith(("/audio/", "./audio/")):
+                relative = src.lstrip("./")
+                if not (site / relative).is_file():
+                    missing.add(relative.removeprefix("audio/"))
+    return sorted(missing)
+
+
+def patch_bundle(source: str, missing_audio: list[str]) -> str:
     if "function jtScore(" in source:
         return source
     cards = "Oe=[" + ",".join(
@@ -42,7 +67,7 @@ def patch_bundle(source: str) -> str:
     source, count = re.subn(r"Oe=\[\{.*?\}\],ke=", lambda _: cards + ",ke=", source, count=1)
     if count != 1:
         raise RuntimeError("category cards anchor missing")
-    funcs = r"""function jtAudioSrc(e){return typeof e===`string`&&e.startsWith(`/api/audio/`)?`https://shengcang-sound-library.jeaess66.chatgpt.site`+e:e}
+    funcs = "var jtMissingAudio=new Set(" + json.dumps(missing_audio, ensure_ascii=False, separators=(",", ":")) + ");\n" + r"""function jtAudioSrc(e){if(typeof e!==`string`)return e;if(e.startsWith(`/api/audio/`))return`https://shengcang-sound-library.jeaess66.chatgpt.site`+e;let t=e.match(/(?:^|\/)audio\/([^?#]+)/);return t&&jtMissingAudio.has(t[1])?`https://shengcang-sound-library.jeaess66.chatgpt.site/audio/`+t[1]:e}
 function jtScore(e,t){let n=t.trim().toLowerCase().split(/[\s,，、＋+]+/).filter(Boolean),r=(e.title||``).toLowerCase(),i=(e.tags||[]).map(e=>e.toLowerCase()),a=(e.subCategory||``).toLowerCase(),o=(e.category||``).toLowerCase();return n.reduce((e,t)=>e+(r===t?100:r.startsWith(t)?60:r.includes(t)?40:0)+(i.includes(t)?24:i.some(e=>e.includes(t))?12:0)+(a.includes(t)?5:0)+(o.includes(t)?2:0),0)}
 function ye(e,t){let n=`${e.title} ${e.category} ${e.subCategory??``} ${(e.tags??[]).join(` `)} ${(e.useCases??[]).join(` `)} ${(e.styleTags??[]).join(` `)} ${(e.materialTags??[]).join(` `)}`.toLowerCase();return t.trim().toLowerCase().split(/[\s,，、＋+]+/).filter(Boolean).every(e=>n.includes(e))}"""
     source, count = re.subn(r"function ye\(e,t\)\{.*?\}(?=function be\()", lambda _: funcs, source, count=1)
@@ -125,7 +150,7 @@ def patch(site: Path) -> None:
     if len(matches) != 1:
         raise RuntimeError(f"expected one library bundle, found {len(matches)}")
     bundle = matches[0]
-    bundle.write_bytes(patch_bundle(bundle.read_text(encoding="utf-8")).encode("utf-8"))
+    bundle.write_bytes(patch_bundle(bundle.read_text(encoding="utf-8"), collect_missing_audio(site)).encode("utf-8"))
     index = site / "index.html"
     html = index.read_text(encoding="utf-8")
     if 'id="sc-finder-v2"' in html:
