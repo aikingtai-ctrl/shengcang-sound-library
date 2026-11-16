@@ -346,7 +346,7 @@ def git_push_if_changed(repo_dir: Path, repo_name: str, msg: str, auto_push: boo
 # ------------------------------------------------------------------------------
 # 1. Shengcang Incremental Sync
 # ------------------------------------------------------------------------------
-SHIM_REV = "20261113d1"
+SHIM_REV = "20261116finder3"
 ZH_SHIM_REV = "20261113g1"
 SC_SHIM = """<style>a[href*="signin-with-chatgpt"]{display:none!important}</style><script id="jintai-shengcang-shim">(function(){
 var BASE=new URL('.',location.href).pathname;if(BASE.slice(-1)!=='/')BASE+='/';window.__JT_BASE__=BASE;
@@ -374,7 +374,8 @@ def sync_shengcang(site_dir: Path, auto_push: bool = True) -> dict:
     cat_refs = sorted(set(re.findall(r"/catalogue-[A-Za-z0-9_.-]+\.json", clean_html)))
     api_data = json.loads(b_a.decode("utf-8"))
     norm_sounds = json.dumps(api_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    fp = sha256_bytes(clean_html.encode("utf-8") + b"|" + norm_sounds + b"|" + SHIM_REV.encode("ascii"))
+    finder_patch = site_dir / "scripts" / "finder_patch.py"
+    fp = sha256_bytes(clean_html.encode("utf-8") + b"|" + norm_sounds + b"|" + SHIM_REV.encode("ascii") + b"|" + finder_patch.read_bytes())
 
     cats_present = all((site_dir / cr.lstrip("/")).is_file() for cr in cat_refs)
     state_p = site_dir / ".sync_state.json"
@@ -461,8 +462,9 @@ def sync_shengcang(site_dir: Path, auto_push: bool = True) -> dict:
 
     final_html = rewrite_vinext_html(clean_html, make_gate_script("金泰 AI · 声仓（影视声音素材库）"), SC_SHIM)
     (site_dir / "index.html").write_bytes(final_html.encode("utf-8"))
+    subprocess.run([sys.executable, str(finder_patch), str(site_dir)], check=True)
     check_html_js_syntax(site_dir / "index.html")
-    state_p.write_text(json.dumps({"fingerprint": fp, "sounds_count": len(items)}, indent=2), encoding="utf-8")
+    state_p.write_bytes(json.dumps({"fingerprint": fp, "sounds_count": len(items)}, indent=2).encode("utf-8"))
 
     changed = git_push_if_changed(site_dir, "shengcang-sound-library", f"sync(auto): upstream shengcang ({len(items)} sounds)", auto_push)
     return {"site": "shengcang", "status": "updated" if changed else "up-to-date", "changed_files": len(changed), "sounds": len(items)}
