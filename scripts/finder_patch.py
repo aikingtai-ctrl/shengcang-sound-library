@@ -57,7 +57,18 @@ def collect_missing_audio(site: Path) -> list[str]:
 
 
 def patch_bundle(source: str, missing_audio: list[str]) -> str:
+    missing_set = "var jtMissingAudio=new Set(" + json.dumps(
+        missing_audio, ensure_ascii=False, separators=(",", ":")
+    ) + ");\n"
     if "function jtScore(" in source:
+        source, count = re.subn(
+            r"var jtMissingAudio=new Set\(\[[^\n]*\]\);\n",
+            lambda _: missing_set,
+            source,
+            count=1,
+        )
+        if count != 1:
+            raise RuntimeError("patched audio fallback anchor missing")
         return source
     cards = "Oe=[" + ",".join(
         "{name:`%s`,english:`SOUND`,category:`%s`,categories:[`%s`],image:`nature`,theme:`mint`,note:`%s`}"
@@ -67,7 +78,7 @@ def patch_bundle(source: str, missing_audio: list[str]) -> str:
     source, count = re.subn(r"Oe=\[\{.*?\}\],ke=", lambda _: cards + ",ke=", source, count=1)
     if count != 1:
         raise RuntimeError("category cards anchor missing")
-    funcs = "var jtMissingAudio=new Set(" + json.dumps(missing_audio, ensure_ascii=False, separators=(",", ":")) + ");\n" + r"""function jtAudioSrc(e){if(typeof e!==`string`)return e;if(e.startsWith(`/api/audio/`))return`https://shengcang-sound-library.jeaess66.chatgpt.site`+e;let t=e.match(/(?:^|\/)audio\/([^?#]+)/);return t&&jtMissingAudio.has(t[1])?`https://shengcang-sound-library.jeaess66.chatgpt.site/audio/`+t[1]:e}
+    funcs = missing_set + r"""function jtAudioSrc(e){if(typeof e!==`string`)return e;if(e.startsWith(`/api/audio/`))return`https://shengcang-sound-library.jeaess66.chatgpt.site`+e;let t=e.match(/(?:^|\/)audio\/([^?#]+)/);return t&&jtMissingAudio.has(t[1])?`https://shengcang-sound-library.jeaess66.chatgpt.site/audio/`+t[1]:e}
 function jtScore(e,t){let n=t.trim().toLowerCase().split(/[\s,，、＋+]+/).filter(Boolean),r=(e.title||``).toLowerCase(),i=(e.tags||[]).map(e=>e.toLowerCase()),a=(e.subCategory||``).toLowerCase(),o=(e.category||``).toLowerCase();return n.reduce((e,t)=>e+(r===t?100:r.startsWith(t)?60:r.includes(t)?40:0)+(i.includes(t)?24:i.some(e=>e.includes(t))?12:0)+(a.includes(t)?5:0)+(o.includes(t)?2:0),0)}
 function ye(e,t){let n=`${e.title} ${e.category} ${e.subCategory??``} ${(e.tags??[]).join(` `)} ${(e.useCases??[]).join(` `)} ${(e.styleTags??[]).join(` `)} ${(e.materialTags??[]).join(` `)}`.toLowerCase();return t.trim().toLowerCase().split(/[\s,，、＋+]+/).filter(Boolean).every(e=>n.includes(e))}"""
     source, count = re.subn(r"function ye\(e,t\)\{.*?\}(?=function be\()", lambda _: funcs, source, count=1)
