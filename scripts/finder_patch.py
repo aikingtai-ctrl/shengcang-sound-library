@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Apply the sound-finding UI to every upstream mirror refresh."""
+"""Apply the sound-finding UI & mirror audio fallback to every upstream refresh (Rollup + Rolldown compatible)."""
 from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -25,11 +26,11 @@ CATEGORIES = [
 ORIGIN = "https://shengcang-sound-library.jeaess66.chatgpt.site"
 
 
-def replace_one(source: str, old: str, new: str, name: str) -> str:
-    count = source.count(old)
+def sub_once(source: str, pattern: str, repl, name: str, flags: int = 0) -> str:
+    updated, count = re.subn(pattern, repl, source, count=1, flags=flags)
     if count != 1:
-        raise RuntimeError(f"{name}: expected one anchor, got {count}")
-    return source.replace(old, new, 1)
+        raise RuntimeError(f"{name}: expected 1 match for {pattern!r}, got {count}")
+    return updated
 
 
 def collect_missing_audio(site: Path) -> list[str]:
@@ -43,13 +44,16 @@ def collect_missing_audio(site: Path) -> list[str]:
         raise RuntimeError("catalogue manifest missing")
     missing: set[str] = set()
     for part in manifest["parts"]:
-        data = json.loads((site / part["url"].lstrip("./")).read_text(encoding="utf-8"))
+        part_path = site / part["url"].lstrip("./")
+        if not part_path.is_file():
+            continue
+        data = json.loads(part_path.read_text(encoding="utf-8"))
         column = data["columns"].index("src")
-        dictionary = data["dictionary"]
+        dictionary = data.get("dictionary") or []
         for row in data["rows"]:
             value = row[column]
             src = dictionary[value] if isinstance(value, int) else value
-            if src.startswith(("/audio/", "./audio/")):
+            if isinstance(src, str) and src.startswith(("/audio/", "./audio/")):
                 relative = src.lstrip("./")
                 if not (site / relative).is_file():
                     missing.add(relative.removeprefix("audio/"))
@@ -60,51 +64,84 @@ def patch_bundle(source: str, missing_audio: list[str]) -> str:
     missing_set = "var jtMissingAudio=new Set(" + json.dumps(
         missing_audio, ensure_ascii=False, separators=(",", ":")
     ) + ");\n"
-    if "function jtScore(" in source:
-        source, count = re.subn(
+    if "function jtAudioSrc(" in source:
+        return sub_once(
+            source,
             r"var jtMissingAudio=new Set\(\[[^\n]*\]\);\n",
             lambda _: missing_set,
-            source,
-            count=1,
+            "update jtMissingAudio",
         )
-        if count != 1:
-            raise RuntimeError("patched audio fallback anchor missing")
-        return source
-    cards = "Oe=[" + ",".join(
+
+    audio_helper = (
+        missing_set
+        + f"function jtAudioSrc(e){{if(typeof e!==`string`)return e;"
+        + f"if(e.startsWith(`/api/audio/`))return`{ORIGIN}`+e;"
+        + f"let t=e.match(/(?:^|\\/)audio\\/([^?#]+)/);"
+        + f"return t&&jtMissingAudio.has(t[1])?`{ORIGIN}/audio/`+t[1]:e}}\n"
+    )
+    source = sub_once(
+        source,
+        r"^((?:import[^;]+;)+)",
+        lambda m: m.group(1) + audio_helper,
+        "inject jtAudioSrc after imports",
+    )
+
+    cards_items = ",".join(
         "{name:`%s`,english:`SOUND`,category:`%s`,categories:[`%s`],image:`nature`,theme:`mint`,note:`%s`}"
         % (name, category, category, note)
         for name, category, note in CATEGORIES
-    ) + "]"
-    source, count = re.subn(r"Oe=\[\{.*?\}\],ke=", lambda _: cards + ",ke=", source, count=1)
-    if count != 1:
-        raise RuntimeError("category cards anchor missing")
-    funcs = missing_set + r"""function jtAudioSrc(e){if(typeof e!==`string`)return e;if(e.startsWith(`/api/audio/`))return`https://shengcang-sound-library.jeaess66.chatgpt.site`+e;let t=e.match(/(?:^|\/)audio\/([^?#]+)/);return t&&jtMissingAudio.has(t[1])?`https://shengcang-sound-library.jeaess66.chatgpt.site/audio/`+t[1]:e}
-function jtScore(e,t){let n=t.trim().toLowerCase().split(/[\s,，、＋+]+/).filter(Boolean),r=(e.title||``).toLowerCase(),i=(e.tags||[]).map(e=>e.toLowerCase()),a=(e.subCategory||``).toLowerCase(),o=(e.category||``).toLowerCase();return n.reduce((e,t)=>e+(r===t?100:r.startsWith(t)?60:r.includes(t)?40:0)+(i.includes(t)?24:i.some(e=>e.includes(t))?12:0)+(a.includes(t)?5:0)+(o.includes(t)?2:0),0)}
-function ye(e,t){let n=`${e.title} ${e.category} ${e.subCategory??``} ${(e.tags??[]).join(` `)} ${(e.useCases??[]).join(` `)} ${(e.styleTags??[]).join(` `)} ${(e.materialTags??[]).join(` `)}`.toLowerCase();return t.trim().toLowerCase().split(/[\s,，、＋+]+/).filter(Boolean).every(e=>n.includes(e))}"""
-    source, count = re.subn(r"function ye\(e,t\)\{.*?\}(?=function be\()", lambda _: funcs, source, count=1)
-    if count != 1:
-        raise RuntimeError("search function anchor missing")
-    patches = [
-        ("A===`new`?t.createdAt-e.createdAt:0",
-         "A===`new`?t.createdAt-e.createdAt:f.trim()?jtScore(t,f)-jtScore(e,f)||e.title.localeCompare(t.title,`zh-CN`):0", "relevance"),
-        ("onChange:e=>p(e.target.value),placeholder:v===`音乐`",
-         "onChange:e=>{if(!f&&e.target.value.trim())$();p(e.target.value)},placeholder:v===`音乐`", "search reset"),
-        ("value:`recommended`,children:`默认排序`",
-         "value:`recommended`,children:f?`最相关`:`默认排序`", "sort label"),
-        ("[Ie,Le]=(0,l.useState)(12)", "[Ie,Le]=(0,l.useState)(24)", "first page"),
-        ("Le(12)},[f,v,w", "Le(24)},[f,v,w", "page reset"),
-        ("Le(Ie+12)", "Le(Ie+24)", "load more"),
-        ("n.src=e.src,Re(e)", "n.src=jtAudioSrc(e.src),Re(e)", "player audio"),
-        ("we,{src:e.src,subtype:e.subtype", "we,{src:jtAudioSrc(e.src),subtype:e.subtype", "wave audio"),
-        ("function _t(e){return gt[e.id]?.url??(e.owned||e.src.startsWith(`/api/`)?`${e.src}?download=1`:e.src)}",
-         "function _t(e){return jtAudioSrc(gt[e.id]?.url??(e.owned||e.src.startsWith(`/api/`)?`${e.src}?download=1`:e.src))}", "download"),
-        ("按场景与用途筛选，点击播放即可试听。",
-         "按标题和标签精准查找，再按类型、用途与时长缩小范围。扩展音频从源站播放。", "help text"),
-        ("if(Object.hasOwn(e,`owned`)){q(e);return}",
-         "if(Object.hasOwn(e,`owned`)||e.src.startsWith(`/api/audio/`)){q({...e,description:`此条为扩展素材；可试听并查看许可。完整来源信息请在原站核对。`,classificationBasis:`按原名称与标签分类，未逐条听感审核。`});return}", "catalogue detail"),
-    ]
-    for old, new, name in patches:
-        source = replace_one(source, old, new, name)
+    )
+    source = sub_once(
+        source,
+        r"([A-Za-z_$][\w$]*)=\[\{name:`环境氛围`,english:`AMBIENCE`.*?\}\](?=[,;])",
+        lambda m: f"{m.group(1)}=[{cards_items}]",
+        "12 compact category cards",
+        flags=re.S,
+    )
+
+    # 1. Player audio element assignment
+    source = sub_once(
+        source,
+        r"([:?])([A-Za-z_$][\w$]*)\.src=([A-Za-z_$][\w$]*)\.src,",
+        lambda m: f"{m.group(1)}{m.group(2)}.src=jtAudioSrc({m.group(3)}.src),",
+        "player audio src",
+    )
+    # 2. IMA_ADPCM WAV fetch fallback (present in Rolldown bundle)
+    if "subtype===`IMA_ADPCM`" in source:
+        source = sub_once(
+            source,
+            r"fetch\(([A-Za-z_$][\w$]*)\.src,\{cache:`no-store`\}\)",
+            lambda m: f"fetch(jtAudioSrc({m.group(1)}.src),{{cache:`no-store`}})",
+            "IMA_ADPCM fetch audio src",
+        )
+    # 3. Waveform preview component src prop
+    source = sub_once(
+        source,
+        r"\{src:([A-Za-z_$][\w$]*)\.src,subtype:\1\.subtype",
+        lambda m: f"{{src:jtAudioSrc({m.group(1)}.src),subtype:{m.group(1)}.subtype",
+        "waveform audio src",
+    )
+    # 4. Download URL resolver
+    source = sub_once(
+        source,
+        r"function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)\{return ([A-Za-z_$][\w$]*)\[\2\.id\]\?\.url\?\?\(\2\.owned\|\|\2\.src\.startsWith\(`/api/`\)\?`\$\{\2\.src\}\?download=1`:\2\.src\)\}",
+        lambda m: (
+            f"function {m.group(1)}({m.group(2)}){{return jtAudioSrc({m.group(3)}[{m.group(2)}.id]?.url??"
+            f"({m.group(2)}.owned||{m.group(2)}.src.startsWith(`/api/`)?`${{{m.group(2)}.src}}?download=1`:{m.group(2)}.src))}}"
+        ),
+        "download url resolver",
+    )
+    # 5. Catalogue extended sound detail fallback without hitting 404 /api/sounds/:id
+    source = sub_once(
+        source,
+        r"if\(Object\.hasOwn\(([A-Za-z_$][\w$]*),`owned`\)\)\{([A-Za-z_$][\w$]*)\(\1\);return\}",
+        lambda m: (
+            f"if(Object.hasOwn({m.group(1)},`owned`)||{m.group(1)}.src.startsWith(`/api/audio/`))"
+            f"{{{m.group(2)}({{...{m.group(1)},description:`此条为扩展素材；可试听并查看许可。完整来源信息请在原站核对。`,"
+            f"classificationBasis:`按原名称与标签分类，未逐条听感审核。`}});return}}"
+        ),
+        "catalogue detail modal",
+    )
     return source
 
 
@@ -149,7 +186,7 @@ html .app-shell .collection-card,html .app-shell .collection-card.featured{heigh
 html .app-shell .collection-copy,html .app-shell .featured .collection-copy{inset:9px 10px}
 html .app-shell .collection-copy>strong,html .app-shell .featured .collection-copy>strong{font-size:16px}
 html .app-shell .collection-note,html .app-shell .featured .collection-note{font-size:11px}
-html .app-shell .collection-bottom{font-size:11px;margin:0}
+html .app-shell .collection-bottom{margin-top:1px;font-size:11px;margin:0}
 }
 </style>
 """
@@ -157,19 +194,27 @@ html .app-shell .collection-bottom{font-size:11px;margin:0}
 
 def patch(site: Path) -> None:
     chunk_dir = site / "_next" / "static" / "chunks"
-    matches = [p for p in chunk_dir.glob("library-*.js") if "function ye(" in p.read_text(encoding="utf-8")]
+    matches = [
+        p for p in chunk_dir.glob("library-*.js")
+        if "collection-grid" in (txt := p.read_text(encoding="utf-8")) and "sound-library" in txt
+    ]
     if len(matches) != 1:
         raise RuntimeError(f"expected one library bundle, found {len(matches)}")
     bundle = matches[0]
-    bundle.write_bytes(patch_bundle(bundle.read_text(encoding="utf-8"), collect_missing_audio(site)).encode("utf-8"))
+    patched_js = patch_bundle(bundle.read_text(encoding="utf-8"), collect_missing_audio(site))
+    bundle.write_bytes(patched_js.encode("utf-8"))
+    chk = subprocess.run(["node", "--check", str(bundle)], capture_output=True, text=True)
+    if chk.returncode != 0:
+        raise RuntimeError(f"JS syntax check failed on {bundle.name}: {chk.stderr}")
+
     index = site / "index.html"
     html = index.read_text(encoding="utf-8")
     if 'id="sc-finder-v2"' in html:
-        html, count = re.subn(r'<style id="sc-finder-v2">.*?</style>', lambda _: STYLE.strip(), html, count=1, flags=re.S)
-        if count != 1:
-            raise RuntimeError("existing finder style missing")
+        html = sub_once(html, r'<style id="sc-finder-v2">.*?</style>', lambda _: STYLE.strip(), "update sc-finder-v2 style", flags=re.S)
     else:
-        html = replace_one(html, "</head>", STYLE + "</head>", "HTML head")
+        if "</head>" not in html:
+            raise RuntimeError("HTML </head> missing")
+        html = html.replace("</head>", STYLE + "</head>", 1)
     index.write_bytes(html.encode("utf-8"))
 
 

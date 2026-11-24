@@ -347,7 +347,7 @@ def git_push_if_changed(repo_dir: Path, repo_name: str, msg: str, auto_push: boo
 # 1. Shengcang Incremental Sync
 # ------------------------------------------------------------------------------
 SHIM_REV = "20261113d1"
-SC_SHIM_REV = "20261116finder4"
+SC_SHIM_REV = "20261124finder5"
 ZH_SHIM_REV = "20261113g1"
 SC_SHIM = """<style>a[href*="signin-with-chatgpt"]{display:none!important}</style><script id="jintai-shengcang-shim">(function(){
 var BASE=new URL('.',location.href).pathname;if(BASE.slice(-1)!=='/')BASE+='/';window.__JT_BASE__=BASE;
@@ -367,6 +367,13 @@ window.fetch=async function(input,init){var urlStr=typeof input==='string'?input
 def sync_shengcang(site_dir: Path, auto_push: bool = True) -> dict:
     git_prepare_repo(site_dir, auto_push)
     base = "https://shengcang-sound-library.fondcream1.chatgpt.site"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(base + "/", headers={"User-Agent": UA}), timeout=15) as r_eff:
+            eff_netloc = urllib.parse.urlparse(r_eff.geturl()).netloc
+            if eff_netloc:
+                base = f"https://{eff_netloc}"
+    except Exception:
+        pass
     st_h, b_h = fetch_bytes(base + "/")
     st_a, b_a = fetch_bytes(base + "/api/sounds")
     if st_h != 200 or st_a != 200:
