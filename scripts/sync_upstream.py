@@ -9,6 +9,8 @@
 """
 import argparse
 import concurrent.futures
+import gzip
+import io
 import hashlib
 import http.client
 import json
@@ -348,7 +350,7 @@ def git_push_if_changed(repo_dir: Path, repo_name: str, msg: str, auto_push: boo
 # ------------------------------------------------------------------------------
 SHIM_REV = "20261113d1"
 SC_SHIM_REV = "20261124finder5"
-ZH_SHIM_REV = "20261113g1"
+ZH_SHIM_REV = "20261124i1"
 SC_SHIM = """<style>a[href*="signin-with-chatgpt"]{display:none!important}</style><script id="jintai-shengcang-shim">(function(){
 var BASE=new URL('.',location.href).pathname;if(BASE.slice(-1)!=='/')BASE+='/';window.__JT_BASE__=BASE;
 var IS_GH=/github\\.io$/i.test(location.hostname||'');
@@ -697,6 +699,371 @@ def norm_zh_rel(base_doc: str, raw_ref: str):
     return norm
 
 
+_ZH_CATALOG_LOADER_RE = re.compile(r'(?<![\w./-])(?:\./|/)?catalog-loader\.js\?v=[0-9a-f]{12,64}', re.I)
+_ZH_CATALOG_RECORD_RE = re.compile(r'(?<![\w./-])(?:\./|/)?catalog-records-([1-9][0-9]*)\.js\?v=[0-9a-f]{12,64}', re.I)
+_ZH_CATALOG_BASE_RE = re.compile(r'(?<![\w./-])(?:\./|/)?catalog-base\.json\.gz\?v=[0-9a-f]{12,64}', re.I)
+
+
+def _fetch_zhonghua_catalog_verified(base: str, ref: str) -> bytes:
+    status, body = fetch_bytes(urllib.parse.urljoin(base, ref), retries=3, timeout=30)
+    if status != 200 or not body:
+        raise RuntimeError(f"中华文明原站目录资源不可用：{ref} (HTTP {status})")
+    # The gzip URL uses a cache revision, not the compressed response's hash.
+    if urllib.parse.urlsplit(ref).path.endswith("catalog-base.json.gz"):
+        if not (body.startswith(b"\x1f\x8b") or body.lstrip().startswith(b"{")):
+            raise RuntimeError(f"中华文明原站目录基础数据格式无效：{ref}")
+        return body
+    version_match = re.search(r"[?&]v=([0-9a-f]{12,64})(?:&|$)", ref, flags=re.I)
+    if not version_match:
+        raise RuntimeError(f"中华文明原站目录资源无版本哈希：{ref}")
+    expected = version_match.group(1).lower()
+    actual = sha256_bytes(body)
+    if not actual.startswith(expected):
+        raise RuntimeError(f"中华文明原站目录资源哈希不符：{ref} (SHA-256 {actual[:12]})")
+    return body
+
+
+def _probe_zhonghua_catalog_asset(base: str, ref: str) -> str:
+    """Check a catalog resource without downloading its multi-megabyte body."""
+    url = urllib.parse.urljoin(base, ref)
+    head_status = 0
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "identity"}, method="HEAD")
+        with urllib.request.urlopen(req, timeout=12) as response:
+            head_status = response.status
+            length = response.headers.get("Content-Length")
+            if head_status == 200 and length and length.isdigit() and int(length) > 0:
+                return length
+    except urllib.error.HTTPError as error:
+        head_status = error.code
+    except Exception:
+        pass
+
+    # Some origins reject HEAD or omit Content-Length. Read only one byte even
+    # when the server ignores Range, so the health check remains lightweight.
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": UA, "Accept-Encoding": "identity", "Range": "bytes=0-0"},
+        )
+        with urllib.request.urlopen(req, timeout=12) as response:
+            if response.status not in (200, 206) or not response.read(1):
+                raise RuntimeError(f"中华文明原站目录资源为空：{ref} (HTTP {response.status})")
+            content_range = response.headers.get("Content-Range", "")
+            total = content_range.rsplit("/", 1)[-1] if "/" in content_range else ""
+            if total.isdigit() and int(total) > 0:
+                return total
+            length = response.headers.get("Content-Length", "") if response.status == 200 else ""
+            return length if length.isdigit() and int(length) > 0 else ">=1"
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"中华文明原站目录资源不可用：{ref} (HEAD {head_status}, GET {error.code})") from error
+    except RuntimeError:
+        raise
+    except Exception as error:
+        raise RuntimeError(f"中华文明原站目录资源不可用：{ref} (HEAD {head_status}, Range GET 失败)") from error
+
+
+def probe_zhonghua_catalog_upstream(base: str, index_bytes: bytes) -> tuple[list[str], dict[str, bytes], str]:
+    """Parse the loader and check every declared catalog asset before sync."""
+    index_text = index_bytes.decode("utf-8", errors="replace")
+    loader_refs = set(_ZH_CATALOG_LOADER_RE.findall(index_text))
+    if len(loader_refs) > 1:
+        raise RuntimeError("中华文明原站目录有多个不同版本的 catalog-loader.js")
+
+    verified_loader = {}
+    catalog_text = index_text
+    if loader_refs:
+        loader_ref = next(iter(loader_refs))
+        loader_rel = norm_zh_rel("index.html", loader_ref)
+        loader_bytes = _fetch_zhonghua_catalog_verified(base, loader_ref)
+        verified_loader[loader_rel] = loader_bytes
+        loader_text = loader_bytes.decode("utf-8")
+        catalog_text += "\n" + loader_text
+        base_ref, script_refs = zh_catalog_loader_references(loader_text)
+        refs = [base_ref, *script_refs]
+    else:
+        record_refs = {}
+        for match in _ZH_CATALOG_RECORD_RE.finditer(catalog_text):
+            number = int(match.group(1))
+            ref = match.group(0)
+            if number in record_refs and record_refs[number] != ref:
+                raise RuntimeError(f"中华文明原站目录分片 {number} 有多个版本")
+            record_refs[number] = ref
+        if not record_refs:
+            raise RuntimeError("中华文明原站未声明 catalog-records 分片，停止覆盖镜像")
+        if sorted(record_refs) != list(range(1, max(record_refs) + 1)):
+            raise RuntimeError("中华文明原站 catalog-records 分片编号不连续")
+        base_refs = set(_ZH_CATALOG_BASE_RE.findall(catalog_text))
+        if len(base_refs) > 1:
+            raise RuntimeError("中华文明原站目录基础数据有多个版本")
+        refs = [*record_refs.values(), *base_refs]
+    health = [f"{ref}:{_probe_zhonghua_catalog_asset(base, ref)}" for ref in refs]
+    fingerprint = sha256_bytes("\n".join([*health, sha256_bytes(catalog_text.encode("utf-8"))]).encode("utf-8"))
+    return refs, verified_loader, fingerprint
+
+
+def verify_zhonghua_catalog_upstream(base: str, refs: list[str], verified_loader: dict[str, bytes]) -> dict[str, bytes]:
+    """Only on a changed snapshot, fully hash and cache every catalog asset."""
+    verified = dict(verified_loader)
+    for ref in refs:
+        rel = norm_zh_rel("index.html", ref)
+        if not rel:
+            raise RuntimeError(f"中华文明原站目录引用无效：{ref}")
+        verified[rel] = _fetch_zhonghua_catalog_verified(base, ref)
+    return verified
+
+
+def zh_catalog_loader_references(source: str) -> tuple[str, list[str]]:
+    """Read the versioned data and script URLs from the upstream loader."""
+    base_match = re.search(r"\bfetch\((['\"])([^'\"]+\.json\.gz(?:\?[^'\"]*)?)\1\)", source)
+    if not base_match:
+        raise ValueError("catalog-loader.js has no gzip catalog reference")
+    base_ref = base_match.group(2)
+    base_rel = norm_zh_rel("catalog-loader.js", base_ref)
+    if not base_rel or not base_rel.endswith(".json.gz"):
+        raise ValueError("catalog-loader.js has an unsafe catalog reference")
+
+    marker = "for(const src of " if "for(const src of " in source else "const __jtLoads="
+    pos = source.find(marker)
+    if pos < 0:
+        raise ValueError("catalog-loader.js has no ordered script list")
+    raw_list, _ = json.JSONDecoder().raw_decode(source[pos + len(marker):])
+    if not isinstance(raw_list, list) or not raw_list:
+        raise ValueError("catalog-loader.js has an empty script list")
+    scripts = []
+    normalized = []
+    for raw in raw_list:
+        rel = norm_zh_rel("catalog-loader.js", raw) if isinstance(raw, str) else None
+        if not rel or not rel.endswith(".js"):
+            raise ValueError(f"catalog-loader.js has an unsafe script reference: {raw!r}")
+        scripts.append(raw)
+        normalized.append(rel)
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("catalog-loader.js has duplicate script references")
+    return base_ref, scripts
+
+
+def zh_catalog_loader_dependencies(source: str) -> tuple[str, list[str]]:
+    """Return safe local paths in the loader's execution order."""
+    base_ref, scripts = zh_catalog_loader_references(source)
+    return (norm_zh_rel("catalog-loader.js", base_ref),
+            [norm_zh_rel("catalog-loader.js", ref) for ref in scripts])
+
+
+def optimize_zh_catalog_loader(data: bytes) -> bytes:
+    """Fetch scripts together while preserving their original execution order, with fast-catalog hook."""
+    source = data.decode("utf-8")
+    zh_catalog_loader_dependencies(source)
+    if "const __jtLoads=" in source and "window.__JT_CATALOG_READY__=" in source and "__JT_SKIP_P2__" in source:
+        return data
+    if source.startswith("window.__JT_CATALOG_READY__="):
+        source = source[len("window.__JT_CATALOG_READY__="):]
+    if "const __jtLoads=" in source and "__JT_SKIP_P2__" not in source:
+        m_prev = re.search(
+            r"const __jtLoads=(\[.*?\])\.map\(src=>new Promise\(\(resolve,reject\)=>\{const script=document\.createElement\('script'\);script\.async=false;script\.src=src;script\.onload=resolve;script\.onerror=\(\)=>reject\(Error\('脚本加载失败：'\+src\)\);document\.body\.append\(script\)\}\)\);await Promise\.all\(__jtLoads\);",
+            source,
+            flags=re.S,
+        )
+        if not m_prev:
+            raise ValueError("unknown previously-patched catalog-loader.js shape")
+        source_list = m_prev.group(1)
+        span_s, span_e = m_prev.span()
+    else:
+        marker = "for(const src of "
+        start = source.find(marker)
+        if start < 0 or not source.startswith("(async()=>{"):
+            raise ValueError("unknown catalog-loader.js shape; refusing an unsafe rewrite")
+        list_start = start + len(marker)
+        _, consumed = json.JSONDecoder().raw_decode(source[list_start:])
+        list_end = list_start + consumed
+        old_tail = ")await new Promise((resolve,reject)=>{const script=document.createElement('script');script.src=src;script.onload=resolve;script.onerror=()=>reject(Error('脚本加载失败：'+src));document.body.append(script)});"
+        if not source.startswith(old_tail, list_end):
+            raise ValueError("unknown catalog-loader.js loading loop; refusing an unsafe rewrite")
+        source_list = source[list_start:list_end]
+        span_s, span_e = start, list_end + len(old_tail)
+
+    replacement = (
+        "const __jtLoads=" + source_list
+        + ".filter(src=>!(typeof window!=='undefined'&&window.__JT_SKIP_P2__&&window.__JT_SKIP_P2__(src)))"
+        + ".map(src=>new Promise((resolve,reject)=>{const script=document.createElement('script');"
+        + "script.async=false;script.src=src;script.onload=resolve;"
+        + "script.onerror=()=>reject(Error('脚本加载失败：'+src));document.body.append(script)}));"
+        + "await Promise.all(__jtLoads);"
+    )
+    patched = source[:span_s] + replacement + source[span_e:]
+    m_fetch_block = re.search(
+        r"""(const response=await fetch\((['"])([^'"]+\.json\.gz(?:\?[^'"]*)?)\2\);.*?window\.ARCHIVE_DATA=JSON\.parse\(await new Response\(decoded\)\.text\(\)\);)""",
+        patched,
+        flags=re.S,
+    )
+    if m_fetch_block and "__JT_FAST_ARCHIVE_PROMISE__" not in patched:
+        orig_block = m_fetch_block.group(1)
+        fast_block = (
+            "if(typeof window!=='undefined'&&window.__JT_FAST_ARCHIVE_PROMISE__){"
+            "window.__JT_BASE_CATALOG_URL__=" + json.dumps(m_fetch_block.group(3)) + ";"
+            "window.ARCHIVE_DATA=await window.__JT_FAST_ARCHIVE_PROMISE__;"
+            "}else{" + orig_block + "}"
+        )
+        patched = patched[:m_fetch_block.start()] + fast_block + patched[m_fetch_block.end():]
+    return ("window.__JT_CATALOG_READY__=" + patched).encode("utf-8")
+
+
+def validate_zh_catalog_downloads(site_dir: Path, loader: str, fetched: set[str]) -> int:
+    """Fail before committing if any current catalog dependency was not fetched."""
+    base_rel, scripts = zh_catalog_loader_dependencies(loader)
+    required = ["catalog-loader.js", base_rel, *scripts]
+    missing = [rel for rel in required if rel not in fetched or not (site_dir / rel).is_file() or not (site_dir / rel).stat().st_size]
+    if missing:
+        raise RuntimeError("incomplete zhonghua catalog; missing: " + ", ".join(missing))
+    try:
+        catalog_path = site_dir / base_rel
+        with catalog_path.open("rb") as raw:
+            magic = raw.read(2)
+        if magic == b"\x1f\x8b":
+            with gzip.open(catalog_path, "rb") as catalog:
+                while catalog.read(1024 * 1024):
+                    pass
+        else:
+            json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, EOFError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("invalid zhonghua gzip catalog") from error
+    return len(scripts)
+
+
+_ZH_LOCAL_MEDIA_RE = re.compile(
+    r'"((?:\./)?(?:assets|(?:[A-Za-z0-9_-]+-)?images|research-[A-Za-z0-9_-]+)/[^"\\\s?#]+)(?:\?[^"\\\s#]*)?"'
+)
+
+
+def discover_zh_catalog_media(data: bytes) -> set[str]:
+    """Find local image paths embedded in the new compressed catalog."""
+    raw = gzip.decompress(data) if data.startswith(b"\x1f\x8b") else data
+    catalog_text = raw.decode("utf-8")
+    media_exts = {".webp", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico", ".woff", ".woff2"}
+    found = set()
+    for match in _ZH_LOCAL_MEDIA_RE.finditer(catalog_text):
+        rel = norm_zh_rel("catalog-base.json.gz", match.group(1))
+        if rel and os.path.splitext(rel)[1].lower() in media_exts:
+            found.add(rel)
+    return found
+
+
+SHANG_ALL_BUILD_REV = "20261124a"
+SHANG_ALL_INPUTS = ("scripts/shang_all.template.html", "shang-all.js", "shang.css")
+
+
+def shang_all_input_fingerprint(site_dir: Path) -> str:
+    """Regenerate the scoped page when its template, script or CSS changes."""
+    digest = hashlib.sha256(SHANG_ALL_BUILD_REV.encode("ascii"))
+    for rel in SHANG_ALL_INPUTS:
+        path = site_dir / rel
+        if not path.is_file() or not path.stat().st_size:
+            raise RuntimeError(f"missing Shang full-catalog input: {rel}")
+        digest.update(rel.encode("utf-8") + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def build_shang_all_snapshot(site_dir: Path, catalog_path: Path) -> dict:
+    """Create a small, deterministic page from every current era=商 record."""
+    shang_all_input_fingerprint(site_dir)
+    version_path = site_dir / "site-version.json"
+    if not version_path.is_file():
+        raise RuntimeError("missing site-version.json for Shang full catalog")
+    revision = json.loads(version_path.read_text(encoding="utf-8")).get("revision", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", revision):
+        raise RuntimeError("invalid site-version revision for Shang full catalog")
+    catalog_bytes = catalog_path.read_bytes()
+    decoded = gzip.decompress(catalog_bytes) if catalog_bytes.startswith(b"\x1f\x8b") else catalog_bytes
+    catalog = json.loads(decoded)
+    if not isinstance(catalog.get("records"), list):
+        raise RuntimeError("Shang source catalog has no records array")
+    records = [record for record in catalog["records"] if isinstance(record, dict) and record.get("era") == "商"]
+    ids = [record.get("id") for record in records]
+    if not records or any(not isinstance(id_, str) or not id_ for id_ in ids) or len(ids) != len(set(ids)):
+        raise RuntimeError("Shang full catalog is empty or has invalid/duplicate IDs")
+    payload = {
+        "version": catalog.get("version"),
+        "revision": revision,
+        "scope": "era=商",
+        "sourcePolicy": catalog.get("sourcePolicy"),
+        "periods": [p for p in catalog.get("periods", []) if isinstance(p, dict) and p.get("name") == "商"],
+        "sourceRevision": revision,
+        "count": len(records),
+        "records": records,
+    }
+    json_bytes = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    buffer = io.BytesIO()
+    with gzip.GzipFile(filename="", mode="wb", fileobj=buffer, compresslevel=6, mtime=0) as archive:
+        archive.write(json_bytes)
+    compressed = buffer.getvalue()
+    data_hash = sha256_bytes(compressed)[:12]
+    template = (site_dir / "scripts" / "shang_all.template.html").read_text(encoding="utf-8")
+    substitutions = {
+        "GATE": make_gate_script("金泰 AI · 中华文明影像库"),
+        "SHIM": ZH_SHIM,
+        "REVISION": revision,
+        "COUNT": str(len(records)),
+        "JS_HASH": sha256_bytes((site_dir / "shang-all.js").read_bytes())[:12],
+        "CSS_HASH": sha256_bytes((site_dir / "shang.css").read_bytes())[:12],
+        "DATA_HASH": data_hash,
+    }
+    if any("{{" + key + "}}" not in template for key in substitutions):
+        raise RuntimeError("Shang full-catalog template is missing required placeholders")
+    html = template
+    for key, value in substitutions.items():
+        html = html.replace("{{" + key + "}}", value)
+    if re.search(r"\{\{[A-Z_]+\}\}", html) or 'id="jt-unified-gate"' not in html:
+        raise RuntimeError("Shang full-catalog template did not render safely")
+    outputs = {
+        "shang-all-data.json.gz": compressed,
+        "shang-all.html": html.encode("utf-8"),
+    }
+    for rel, content in outputs.items():
+        path = site_dir / rel
+        if not path.is_file() or path.read_bytes() != content:
+            path.write_bytes(content)
+    check_html_js_syntax(site_dir / "shang-all.html")
+    return {"count": len(records), "data_hash": data_hash, "revision": revision}
+
+
+def shang_all_snapshot_ready(site_dir: Path) -> bool:
+    """Guard the no-op sync path against missing or stale scoped output."""
+    try:
+        shang_all_input_fingerprint(site_dir)
+        page = (site_dir / "shang-all.html").read_text(encoding="utf-8")
+        data = (site_dir / "shang-all-data.json.gz").read_bytes()
+        revision = json.loads((site_dir / "site-version.json").read_text(encoding="utf-8"))["revision"]
+        payload = json.loads(gzip.decompress(data))
+        records = payload["records"]
+        count = len(records)
+        return (
+            bool(count)
+            and payload.get("count") == count
+            and payload.get("sourceRevision") == revision
+            and payload.get("revision") == revision
+            and all(isinstance(r, dict) and r.get("era") == "商" for r in records)
+            and all(isinstance(r.get("id"), str) and r.get("id") for r in records)
+            and len({r.get("id") for r in records}) == count
+            and f'name="atlas-snapshot-revision" content="{revision}"' in page
+            and f'name="shang-all-data-hash" content="{sha256_bytes(data)[:12]}"' in page
+            and f'shang-all.js?v={sha256_bytes((site_dir / "shang-all.js").read_bytes())[:12]}' in page
+            and f'shang.css?v={sha256_bytes((site_dir / "shang.css").read_bytes())[:12]}' in page
+            and 'id="jt-unified-gate"' in page
+        )
+    except (OSError, KeyError, TypeError, ValueError, EOFError):
+        return False
+
+
+def shang_all_index_ready(site_dir: Path) -> bool:
+    try:
+        page = (site_dir / "index.html").read_text(encoding="utf-8")
+        return ('id="jt-shang-all-route"' in page
+                and 'id="jt-shang-all-link"' in page
+                and page.index('id="jt-shang-all-route"') < page.index('id="jt-unified-gate"'))
+    except (OSError, ValueError):
+        return False
+
+
 ZH_OLD_UNPACK_1 = '((k,d,x)=>{const u=v=>{if(Array.isArray(v))return v.map(u);if(!v||typeof v!=="object")return v;if(Object.hasOwn(v,"$s"))return d[v.$s];const a=v.$o,p=[];for(let i=0;i<a.length;i+=2)p.push([k[a[i]],u(a[i+1])]);return Object.fromEntries(p)};return u(x)})'
 ZH_NEW_UNPACK_1 = '((k,d,x)=>{const u=v=>{if(Array.isArray(v)){const n=v.length,r=new Array(n);for(let i=0;i<n;i++)r[i]=u(v[i]);return r}if(!v||typeof v!=="object")return v;if(v.$s!==undefined)return d[v.$s];const a=v.$o,o={};for(let i=0;i<a.length;i+=2)o[k[a[i]]]=u(a[i+1]);return o};return u(x)})'
 ZH_OLD_UNPACK_2 = '((d,x)=>{const u=v=>Array.isArray(v)?v.map(u):v&&typeof v==="object"?(Object.hasOwn(v,"$s")?d[v.$s]:Object.fromEntries(Object.entries(v).map(([k,w])=>[k,u(w)]))):v;return u(x)})'
@@ -712,7 +1079,181 @@ ZH_DEFERRED_P2 = {
 }
 
 
+ZH_FAST_DETAIL_ONLY_KEYS = {
+    "citation", "verification", "previewVerification", "sourceMetadata", "rights", "rightsUrl",
+    "additionalSources", "provenance", "apiUrl", "verifiedAt", "sourceType", "physicalDescription",
+    "dimensions", "documentPage", "originalMaterial", "originalDate", "imageViewDescription",
+    "datingBasis", "metPeriodNote", "sourceRecordSha256", "imageSha256", "rightsEvidence",
+    "sourceEvidence", "thumbnailUrl", "previewHash", "sourceHttpBodySha256", "localEvidenceImage",
+    "fileHash", "reconciliation",
+}
+
+
+def prune_retired_zhonghua_chunks(site_dir: Path) -> list[str]:
+    """Remove unreferenced legacy data.js & catalog-records-*.js once catalog-loader.js is active."""
+    idx_p = site_dir / "index.html"
+    if not idx_p.is_file() or not (site_dir / "catalog-loader.js").is_file() or not (site_dir / "catalog-base.json.gz").is_file():
+        return []
+    if "catalog-loader.js" not in idx_p.read_text(encoding="utf-8", errors="ignore"):
+        return []
+    candidates = [p for p in sorted(site_dir.glob("catalog-records-*.js"))]
+    if (site_dir / "data.js").is_file():
+        candidates.append(site_dir / "data.js")
+    if not candidates:
+        return []
+    cand_names = {p.name for p in candidates}
+    referenced = set()
+    for doc in list(site_dir.rglob("*.html")) + list(site_dir.glob("*.js")):
+        if ".git" in doc.parts or doc.name in cand_names:
+            continue
+        txt = doc.read_text(encoding="utf-8", errors="ignore")
+        for m in re.finditer(r"(?<![A-Za-z0-9_-])(data\.js|catalog-records-\d+\.js)\b", txt):
+            referenced.add(m.group(1))
+    removed = []
+    for p in candidates:
+        if p.name not in referenced:
+            p.unlink(missing_ok=True)
+            removed.append(p.name)
+    return removed
+
+
+def build_zhonghua_fast_catalog(site_dir: Path) -> dict | None:
+    """Build deterministic columnar catalog-fast.json.gz (~65% smaller) for instant t=0 hydration."""
+    from collections import Counter
+    loader_p = site_dir / "catalog-loader.js"
+    if not loader_p.is_file():
+        return None
+    try:
+        catalog_rel, scripts = zh_catalog_loader_dependencies(loader_p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    cat_p = site_dir / catalog_rel
+    if not cat_p.is_file():
+        return None
+    raw_b = cat_p.read_bytes()
+    dec_b = gzip.decompress(raw_b) if raw_b.startswith(b"\x1f\x8b") else raw_b
+    obj = json.loads(dec_b.decode("utf-8"))
+    recs = obj.get("records")
+    if not isinstance(recs, list) or not recs:
+        return None
+
+    p1_props = {
+        "id", "catalogNumber", "title", "originalTitle", "era", "polity", "date", "originalPeriod",
+        "material", "institution", "institutionShort", "objectNumber", "category", "evidence",
+        "openLicense", "localImage", "previewUrl", "imageUrl", "originalImageUrl", "displayMode",
+        "imageCredit", "tangPhase", "xiaScope", "crosses1227", "crossesDeclaredPeriod",
+        "dateDisputed", "visualScope", "metPeriodVersion", "periodReview", "lifeFocus",
+        "lifeScenes", "socialGroups", "batch", "batchId", "sourceTitle", "sourceUrl",
+        "provenanceKind", "locator", "publicationLabel", "visualSubcategoryLabels", "subjects",
+        "relatedCategories", "visibleDetails", "sceneUse", "description", "notes", "findspot",
+        "imageObjectDate", "historicalDate", "chronologyRelation", "rulerLinks",
+    }
+    p2_all = ZH_DEFERRED_P2 | {"library-quality-ui.js"}
+    for s in scripts:
+        fn = os.path.basename(s)
+        if fn in p2_all or fn.endswith("-data.js") or not (site_dir / s).is_file():
+            continue
+        stxt = (site_dir / s).read_text(encoding="utf-8", errors="ignore")
+        for m in re.finditer(r"\b(?:r|rec|record|item|x)\.([A-Za-z_][A-Za-z0-9_]*)", stxt):
+            p1_props.add(m.group(1))
+
+    all_keys = set()
+    for r in recs:
+        if isinstance(r, dict):
+            all_keys.update(r.keys())
+    cols = sorted((all_keys & p1_props) - ZH_FAST_DETAIL_ONLY_KEYS)
+
+    str_counts = Counter()
+    for r in recs:
+        loc_img = r.get("localImage")
+        has_hosted_local = isinstance(loc_img, str) and bool(loc_img) and not loc_img.startswith("research-")
+        for c in cols:
+            v = r.get(c)
+            if v is None:
+                continue
+            if has_hosted_local and c in ("previewUrl", "imageUrl", "originalImageUrl"):
+                continue
+            if c == "previewUrl" and v == loc_img:
+                continue
+            if c == "originalImageUrl" and v == r.get("imageUrl"):
+                continue
+            if isinstance(v, str) and len(v) >= 3:
+                str_counts[v] += 1
+
+    str_list = [s for s, cnt in str_counts.most_common() if cnt >= 3 and len(s) * (cnt - 1) > 12]
+    str_to_id = {s: idx for idx, s in enumerate(str_list)}
+
+    rows = []
+    cma_pins = {}
+    for idx_r, r in enumerate(recs):
+        if "cma-101711" in str(r.get("id", "")) and "sourceRecordSha256" in r:
+            cma_pins[str(idx_r)] = r["sourceRecordSha256"]
+        loc_img = r.get("localImage")
+        has_hosted_local = isinstance(loc_img, str) and bool(loc_img) and not loc_img.startswith("research-")
+        img_url = r.get("imageUrl")
+        row = []
+        for c in cols:
+            v = r.get(c)
+            if v is None or (has_hosted_local and c in ("previewUrl", "imageUrl", "originalImageUrl")):
+                row.append(None)
+            elif c == "previewUrl" and v == loc_img:
+                row.append(-1)
+            elif c == "originalImageUrl" and v == img_url:
+                row.append(-2)
+            elif isinstance(v, str) and v in str_to_id:
+                row.append(chr(1) + format(str_to_id[v], "x"))
+            else:
+                row.append(v)
+        while row and row[-1] is None:
+            row.pop()
+        rows.append(row)
+
+    meta = {k: v for k, v in obj.items() if k != "records"}
+    pack = {"v": 1, "meta": meta, "cols": cols, "dict": str_list, "rows": rows, "cmaPins": cma_pins}
+    raw_out = json.dumps(pack, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    buf = io.BytesIO()
+    with gzip.GzipFile(filename="", mode="wb", fileobj=buf, compresslevel=6, mtime=0) as gz:
+        gz.write(raw_out)
+    gz_bytes = buf.getvalue()
+    out_p = site_dir / "catalog-fast.json.gz"
+    if not out_p.is_file() or out_p.read_bytes() != gz_bytes:
+        out_p.write_bytes(gz_bytes)
+    p1_urls = [
+        f"./{s}?v={sha256_bytes((site_dir / s).read_bytes())[:12]}"
+        for s in scripts
+        if os.path.basename(s) not in p2_all and (site_dir / s).is_file()
+    ]
+    p2_urls = [
+        f"./{s}?v={sha256_bytes((site_dir / s).read_bytes())[:12]}"
+        for s in scripts
+        if os.path.basename(s) in p2_all and (site_dir / s).is_file()
+    ]
+    return {
+        "fast_hash": sha256_bytes(gz_bytes)[:12],
+        "fast_bytes": len(gz_bytes),
+        "p1_urls": p1_urls,
+        "p2_urls": p2_urls,
+    }
+
+
+ZH_FAST_CHRONOLOGY_CORE = "/* One attribution rule is shared by navigation counts, galleries and exports. */\n(function(root){\n  const _normCache=new Map();\n  const normalize=s=>{const str=String(s??'');let v=_normCache.get(str);if(v===undefined){v=str.normalize('NFKC').replace(/[祐佑]/g,'祐').replace(/\\s/g,'');if(_normCache.size<20000)_normCache.set(str,v);}return v;};\n  const valid=v=>typeof v==='number'&&Number.isFinite(v)&&v!==0;\n  const year=y=>y<0?'前'+Math.abs(y):String(y);\n  const years=(a,b)=>valid(a)&&valid(b)?(a===b?year(a):year(a)+'–'+year(b))+'年':'';\n  const samePolity=(r,n)=>r.era===n.parentEra&&(n.parentEra==='唐'?(['date-bucket','undated','collection'].includes(n.kind)||!r.polity||r.polity===(n.polity||n.parentEra)):(!n.polity||n.polity===n.parentEra||r.polity===n.polity));\n  const contained=(d,n)=>d.points?.length?d.points.some(y=>y>=n.start&&y<=n.end):d.start>=n.start&&d.end<=n.end;\n  function spans(entries){\n    const out=[];\n    for(const e of entries.filter(e=>!e.indexOnly&&valid(e.start)&&valid(e.end)).sort((a,b)=>a.start-b.start)){\n      const last=out.at(-1);\n      if(last&&e.start<=last.end+1)last.end=Math.max(last.end,e.end);else out.push({start:e.start,end:e.end});\n    }\n    return out;\n  }\n  function hasRecId(node,id){\n    const arr=node.recordIds;if(!arr)return false;\n    if(node._recSet&&node._recSetSrc===arr)return node._recSet.has(id);\n    node._recSetSrc=arr;node._recSet=new Set(arr);return node._recSet.has(id);\n  }\n  function create(data,records){\n    const entries=data.entries||[],overrides=data.recordDates||{},audit=data.recordAttribution||{};\n    const effPolity=r=>audit[r.id]?.polity||r.polity;\n    const inPolity=(r,n)=>{const ep=audit[r.id]?.polity;return samePolity(ep?{era:r.era,polity:ep}:r,n);};\n    const dates=new Map,entriesByEra=new Map,recordsByEra=new Map,scopeCache=new Map,countCache=new Map,unassigned=new Map;\n    for(const e of entries){\n      e._normReign=e.reign?normalize(e.reign):'';\n      if(!entriesByEra.has(e.parentEra))entriesByEra.set(e.parentEra,[]);\n      entriesByEra.get(e.parentEra).push(e);\n    }\n    for(const r of records){\n      if(!recordsByEra.has(r.era))recordsByEra.set(r.era,[]);\n      recordsByEra.get(r.era).push(r);\n    }\n    function getScope(era,pol){\n      const key=(era||'')+'\\0'+(pol||'');\n      let sc=scopeCache.get(key);\n      if(sc)return sc;\n      const probe={era,polity:pol};\n      const es=(entriesByEra.get(era)||[]).filter(e=>samePolity(probe,e)&&!e.indexOnly);\n      const rulerIds=[...new Set(es.map(e=>e.rulerId).filter(Boolean))];\n      const rulerMeta=rulerIds.map(id=>{\n        const children=es.filter(e=>e.rulerId===id);\n        return {id,childIds:new Set(children.map(c=>c.id)),spans:spans(children)};\n      });\n      sc={es,datedEs:es.filter(e=>!e.recordIds&&valid(e.start)&&valid(e.end)),rulerMeta};\n      scopeCache.set(key,sc);\n      return sc;\n    }\n    const eligible=r=>!!r.sourceUrl&&!r.contextOnly&&!r.dateDisputed&&!['conditional','later-comparison'].includes(r.visualScope)&&!audit[r.id]?.contextOnly&&(!r.dateRelation||r.dateRelation==='object')&&(!audit[r.id]?.relation||audit[r.id].relation==='object');\n    for(const r of records){\n      const sc=getScope(r.era,effPolity(r)),es=sc.es;\n      const broad=/未细分|未作更细|朝代宽断代|不是制造纪年/.test((r.date||'')+(r.datePrecision||''));\n      const override=r.era==='唐'&&(r.historicalRange||valid(r.dateStart)&&valid(r.dateEnd))&&!overrides[r.id]?.attribution?null:overrides[r.id];\n      let d=override?{...override}:r.historicalRange?{...r.historicalRange}:valid(r.dateStart)&&valid(r.dateEnd)&&!broad?{start:r.dateStart,end:r.dateEnd,note:r.datePrecision||r.datingBasis||'来源著录的年代范围'}:null;\n      if(r.id==='arch-tang-foguang-landscape'&&d)d={...d,relation:'foundation',note:'857为东大殿创建纪年；建筑群现状含后世遗存，只作历史关联。'};\n      const normRDate=es.length&&r.date?normalize(r.date):'';\n      const named=normRDate?es.filter(e=>e._normReign&&normRDate.includes(e._normReign)&&(!d||d.start<=e.end&&d.end>=e.start)):[];\n      if(!d&&named.length===1&&!broad&&!r.contextOnly&&valid(named[0].start)&&valid(named[0].end))d={start:named[0].start,end:named[0].end,note:'来源著录标明年号；公元范围据纪年目录对照'};\n      if(d){\n        d.relation=audit[r.id]?.relation||r.dateRelation||d.relation||'object';\n        d.contextOnly=!eligible(r);\n        d.reignIds=d.reignIds?.length?d.reignIds:d.ignoreOriginalReign?[]:r.reignIds?.length?r.reignIds:named.map(e=>e.id);\n        d.note=audit[r.id]?.note||d.note;\n        const rSet=d.reignIds.length?new Set(d.reignIds):null;\n        let possibleCount=0;\n        if(!d.points?.length){\n          for(const e of sc.datedEs){if((!rSet||rSet.has(e.id))&&contained(d,e)){if(++possibleCount>1)break;}}\n        }\n        d.ambiguousReign=!d.points?.length&&possibleCount>1;\n        let possibleRulerCount=0;\n        if(!d.points?.length){\n          for(const rm of sc.rulerMeta){\n            if((!rSet||d.reignIds.some(rid=>rm.childIds.has(rid)))&&rm.spans.some(n=>contained(d,n))){\n              if(++possibleRulerCount>1)break;\n            }\n          }\n        }\n        d.ambiguousRuler=!d.points?.length&&possibleRulerCount>1;\n      }\n      dates.set(r.id,d);\n    }\n    function match(r,node,mode='contained'){\n      if(!r||!node||!inPolity(r,node))return false;\n      if(node.parentEra==='唐'&&node.kind==='date-bucket')return hasRecId(node,r.id);\n      if(node.kind==='collection')return hasRecId(node,r.id);\n      if(node.kind==='undated'){\n        if(!unassigned.has(r.id))unassigned.set(r.id,!(entriesByEra.get(r.era)||[]).some(e=>match(r,e._asNode||(e._asNode={...e,kind:e.kind||'reign'}),'contained')));\n        return unassigned.get(r.id);\n      }\n      if(node.indexOnly)return false;\n      const d=dates.get(r.id);\n      if(mode==='contained'&&node.kind==='reign'&&d?.rulerOnly)return false;\n      if(node.kind==='ruler'&&d?.rulerIds?.length&&!d.rulerIds.includes(node.id))return false;\n      if(mode==='contained'&&(!eligible(r)||d?.contextOnly||d?.relation&&d.relation!=='object'))return false;\n      if(node.recordIds){\n        if(!hasRecId(node,r.id)||node.qinRulerId&&!(r.qinRulerLinks||[]).some(l=>l.id===node.qinRulerId&&l.relation==='direct'))return false;\n        if(d&&valid(d.start)&&valid(d.end)&&valid(node.start)&&valid(node.end))return contained(d,node);\n        return true;\n      }\n      if(!d||!valid(d.start)||!valid(d.end)||!valid(node.start)||!valid(node.end))return false;\n      if(Boolean(d.relation&&d.relation!=='object')!==(mode==='context'))return false;\n      if(node.kind==='reign'&&d.reignIds?.length&&!d.reignIds.includes(node.id))return false;\n      if(node.kind==='ruler'&&node.entries&&d.reignIds?.length&&!node.entries.some(e=>d.reignIds.includes(e.id)))return false;\n      if(mode==='contained'&&(node.kind==='reign'&&d.ambiguousReign||node.kind==='ruler'&&d.ambiguousRuler))return false;\n      const ranges=node.kind==='ruler'&&node.entries?(node._spans||(node._spans=spans(node.entries))):[node];\n      return ranges.some(n=>mode==='overlap'?d.points?.length?d.points.some(y=>y>=n.start&&y<=n.end):d.start<=n.end&&d.end>=n.start:contained(d,n));\n    }\n    function reason(r){\n      const d=dates.get(r.id);\n      if(audit[r.id]?.note)return audit[r.id].note;\n      if(!eligible(r)||d?.contextOnly||d?.relation&&d.relation!=='object')return '关联背景、载体差异或存疑资料，不能作为具体纪年的直接图证';\n      if(!d)return '来源未提供可归入具体纪年的断代';\n      if(d.ambiguousReign)return '同年改元或纪年重叠，现有依据无法唯一确定年号';\n      return '原始断代跨度超过单个纪年，或尚无明确的纪年归属依据';\n    }\n    function explain(r,node){\n      if(node?.kind==='undated')return reason(r);\n      const d=dates.get(r.id);\n      if(node?.qinRulerId)return (r.qinRulerLinks||[]).find(l=>l.id===node.qinRulerId&&l.relation==='direct')?.reason||'以直接纪年和铭文为据';\n      if(node?.recordIds)return '依据馆藏、铭文或考古分期关联；未推定公元确年';\n      if(d?.points?.length)return '依据分立题记年份 '+d.points.filter(y=>y>=node.start&&y<=node.end).map(year).join('、')+'；不是连续制作年代';\n      return (d?.note||'来源断代完整落入所选时期')+'（'+years(d?.start,d?.end)+'）';\n    }\n    function count(node,mode='contained'){\n      if(!node)return 0;\n      const key=[node.id,node.kind,node.start,node.end,node.polity,mode].join('|');\n      if(!countCache.has(key)){\n        const bucket=recordsByEra.get(node.parentEra)||[];\n        let cnt=0;\n        for(let i=0;i<bucket.length;i++)if(match(bucket[i],node,mode))cnt++;\n        countCache.set(key,cnt);\n      }\n      return countCache.get(key);\n    }\n    return {dates,match,count,explain,reason};\n  }\n  const api={normalize,year,years,create};root.ChronologyCore=api;\n  if(typeof module!=='undefined'&&module.exports)module.exports=api;\n})(typeof window==='undefined'?globalThis:window);\n"
+
+
 def optimize_zhonghua_js_bytes(rel: str, data: bytes) -> bytes:
+    if os.path.basename(rel) == "chronology-core.js" and b"root.ChronologyCore=api" in data:
+        return ZH_FAST_CHRONOLOGY_CORE.encode("utf-8")
+    if os.path.basename(rel) == "chronology.js" and b"function renderChronology(){" in data:
+        t_ch = data.decode("utf-8")
+        if "__JT_DEFER_CHRON__" not in t_ch:
+            t_ch = re.sub(
+                r"(function\s+renderChronology\(\)\s*\{\s*if\s*\(!chronologyIndex)\)(\s*return;)",
+                r"\1||(typeof window!=='undefined'&&window.__JT_DEFER_CHRON__))\2",
+                t_ch,
+                count=1,
+            )
+        return t_ch.encode("utf-8")
+    if os.path.basename(rel) == "catalog-loader.js":
+        return optimize_zh_catalog_loader(data)
     if not rel.endswith(".js") or len(data) < 4096:
         return data
     try:
@@ -779,10 +1320,13 @@ def _build_zh_async_loader_tag(all_srcs: list[str], p1: list[str], p2: list[str]
         "var el=document.querySelector(sel);if(el)try{el.click();}catch(e){}"
         "}"
         "}"
-        "async function boot(){await runList(p1);if(window.__jtSanitizeAll)window.__jtSanitizeAll();window.__JT_HYDRATED__=true;"
+        "async function boot(){await runList(p1);if(window.__JT_CATALOG_READY__)await window.__JT_CATALOG_READY__;if(window.__JT_DEFER_CHRON__){window.__JT_DEFER_CHRON__=false;if(typeof renderChronology==='function')renderChronology();}"
+        "if(window.__jtSanitizeAll)window.__jtSanitizeAll();window.__JT_HYDRATED__=true;"
+        "if(window.__jtInstallDetailHydrator)window.__jtInstallDetailHydrator();"
         "if(['#tangReignDossier','#xixiaReignDossier'].indexOf(location.hash)!==-1)window.dispatchEvent(new Event('load'));"
         "await replayPending(true);"
-        "if(p2.length){var rp=function(){runList(p2);};if(typeof requestIdleCallback==='function')requestIdleCallback(rp,{timeout:600});else setTimeout(rp,350);}}"
+        "var bg=function(){var extra=(window.__JT_DEFERRED_P2_URLS__||[]).concat(p2);p2=[];runList(extra).then(function(){if(window.__jtEnsureFullCatalog)window.__jtEnsureFullCatalog();});};"
+        "if(typeof requestIdleCallback==='function')requestIdleCallback(bg,{timeout:500});else setTimeout(bg,250);}"
         "if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){setTimeout(boot,0);},{once:true});else setTimeout(boot,0);"
         "})();"
     )
@@ -790,17 +1334,29 @@ def _build_zh_async_loader_tag(all_srcs: list[str], p1: list[str], p2: list[str]
 
 
 def _compute_zhonghua_ssg_payload(site_dir: Path) -> dict | None:
-    if not (site_dir / "data.js").is_file():
+    index_path = site_dir / "index.html"
+    if not index_path.is_file():
+        return None
+    new_catalog = "catalog-loader.js" in index_path.read_text(encoding="utf-8", errors="ignore")
+    catalog_rel = zh_catalog_loader_dependencies((site_dir / "catalog-loader.js").read_text(encoding="utf-8"))[0] if new_catalog else "data.js"
+    if not (site_dir / catalog_rel).is_file():
         return None
     node_js = r"""
-const fs = require('fs'), path = require('path'), vm = require('vm');
+const fs = require('fs'), path = require('path'), vm = require('vm'), zlib = require('zlib');
 const dir = process.argv[1];
+const catalogRel = process.argv[2];
 const ctx = { window: {} };
 vm.createContext(ctx);
-vm.runInContext(fs.readFileSync(path.join(dir, 'data.js'), 'utf8'), ctx);
-for (let i = 1; i <= 20; i++) {
-  const p = path.join(dir, `catalog-records-${i}.js`);
-  if (fs.existsSync(p)) vm.runInContext(fs.readFileSync(p, 'utf8'), ctx);
+if (fs.readFileSync(path.join(dir, 'index.html'), 'utf8').includes('catalog-loader.js')) {
+  const b = fs.readFileSync(path.join(dir, catalogRel));
+  const decoded = b[0]===31 && b[1]===139 ? zlib.gunzipSync(b) : b;
+  ctx.window.ARCHIVE_DATA = JSON.parse(decoded.toString('utf8'));
+} else {
+  vm.runInContext(fs.readFileSync(path.join(dir, 'data.js'), 'utf8'), ctx);
+  for (let i = 1; i <= 20; i++) {
+    const p = path.join(dir, `catalog-records-${i}.js`);
+    if (fs.existsSync(p)) vm.runInContext(fs.readFileSync(p, 'utf8'), ctx);
+  }
 }
 const records = (ctx.window.ARCHIVE_DATA && ctx.window.ARCHIVE_DATA.records) || [];
 function displayTitleText(value){const opened={em:[],i:[],b:[],strong:[]};return String(value??'').replace(/<\/?(em|i|b|strong)(?=[\s>])[^>]*>/gi,(tag,name)=>{const key=name.toLowerCase(),closing=tag[1]==='/',plain=new RegExp('^<'+(closing?'/':'')+key+'\\s*>$','i').test(tag);if(!closing){opened[key].push(plain);return plain?'':tag}return plain&&opened[key].pop()===true?'':tag})}
@@ -823,7 +1379,7 @@ process.stdout.write(JSON.stringify({
   cardsHtml
 }));
 """
-    r = subprocess.run(["node", "-e", node_js, str(site_dir)], capture_output=True, text=True, encoding="utf-8", timeout=45)
+    r = subprocess.run(["node", "-e", node_js, str(site_dir), catalog_rel], capture_output=True, text=True, encoding="utf-8", timeout=45)
     if r.returncode != 0 or not r.stdout.strip():
         return None
     return json.loads(r.stdout)
@@ -831,6 +1387,7 @@ process.stdout.write(JSON.stringify({
 
 def optimize_zhonghua_site(site_dir: Path) -> dict:
     import html as _html
+    pruned_chunks = prune_retired_zhonghua_chunks(site_dir)
     js_hashes: dict[str, str] = {}
     js_modified = 0
     for jp in sorted(site_dir.glob("*.js")):
@@ -841,12 +1398,13 @@ def optimize_zhonghua_site(site_dir: Path) -> dict:
             js_modified += 1
         js_hashes[jp.name] = sha256_bytes(opt)[:12]
 
+    fast_cat = build_zhonghua_fast_catalog(site_dir)
     ssg = _compute_zhonghua_ssg_payload(site_dir)
     gate_tag = make_gate_script("金泰 AI · 中华文明影像库")
     html_modified = 0
 
     for hp in sorted(site_dir.rglob("*.html")):
-        if ".git" in hp.parts:
+        if ".git" in hp.parts or hp == site_dir / "scripts" / "shang_all.template.html":
             continue
         orig = hp.read_text(encoding="utf-8", errors="ignore")
         txt = orig
@@ -854,6 +1412,86 @@ def optimize_zhonghua_site(site_dir: Path) -> dict:
         # 1. Refresh unified gate & ZH_SHIM
         txt = re.sub(r'<style>a\[href\*="signin-with-chatgpt"\][^<]*</style><script id="jintai-zhonghua-cdn-shim">.*?</script>', ZH_SHIM, txt, count=1, flags=re.S)
         txt = re.sub(r'<script id="jt-unified-gate">.*?</script>', gate_tag, txt, count=1, flags=re.S)
+
+        # The exact full-catalog Shang route is handled before the gated index
+        # starts its heavyweight loader. The destination carries the same gate.
+        if hp == site_dir / "index.html" and (site_dir / "shang-all.html").is_file() and gate_tag in txt:
+            route_tag = ('<script id="jt-shang-all-route">(function(){'
+                         'var p=new URLSearchParams(location.hash.slice(1));'
+                         'if(p.get("era")==="商"&&Array.from(p.keys()).length===1)'
+                         'location.replace(new URL("shang-all.html",location.href).href)'
+                         '})();</script>')
+            txt = re.sub(r'<script id="jt-shang-all-route">.*?</script>', '', txt, count=1, flags=re.S)
+            txt = txt.replace(gate_tag, route_tag + gate_tag, 1)
+            if 'id="jt-shang-all-link"' not in txt:
+                txt = re.sub(
+                    r'(<div class="hero-actions">)(.*?)(</div>)',
+                    lambda m_: (m_.group(1) + m_.group(2)
+                                + '<a class="hero-index-link" id="jt-shang-all-link" href="./shang-all.html">商代全库快览 →</a>'
+                                + m_.group(3)),
+                    txt,
+                    count=1,
+                    flags=re.S,
+                )
+
+        # 1b. Inject t=0 streaming fast-catalog + HTTP/2 P1 prefetch on index.html
+        txt = re.sub(r'<link id="jt-zh-fast-preload"[^>]*>', '', txt)
+        txt = re.sub(r'<script id="jt-zh-fast-boot">.*?</script>', '', txt, flags=re.S)
+        if hp == site_dir / "index.html" and fast_cat and ZH_SHIM in txt:
+            f_url = f"./catalog-fast.json.gz?v={fast_cat['fast_hash']}"
+            p1_json = json.dumps(fast_cat["p1_urls"], ensure_ascii=False, separators=(",", ":"))
+            p2_json = json.dumps(fast_cat["p2_urls"], ensure_ascii=False, separators=(",", ":"))
+            p2_names_json = json.dumps(sorted(ZH_DEFERRED_P2 | {"library-quality-ui.js"}), ensure_ascii=False, separators=(",", ":"))
+            fast_tag = (
+                f'<link id="jt-zh-fast-preload" rel="preload" href="{f_url}" as="fetch" crossorigin>'
+                '<script id="jt-zh-fast-boot">(function(){'
+                'if(window.__JT_LOCKED__||location.protocol==="file:")return;'
+                f'var fastUrl={json.dumps(f_url)},p1Urls={p1_json},p2Urls={p2_json},p2Set=new Set({p2_names_json});'
+                'if(location.hash==="#expansion")return;'
+                'if(!location.hash)window.__JT_DEFER_CHRON__=true;'
+                'window.__JT_SKIP_P2__=function(s){var fn=String(s).split("?")[0].split("/").pop();return p2Set.has(fn);};'
+                'window.__JT_DEFERRED_P2_URLS__=p2Urls;'
+                'function gunzipJson(u){return fetch(u).then(function(r){if(!r.ok)throw Error("HTTP "+r.status);'
+                'if(r.body&&typeof DecompressionStream!=="undefined"){return new Response(r.body.pipeThrough(new DecompressionStream("gzip"))).json();}'
+                'return r.arrayBuffer().then(function(ab){var b=new Uint8Array(ab);var s=new Blob([b]).stream();'
+                'var d=(b[0]===31&&b[1]===139&&typeof DecompressionStream!=="undefined")?s.pipeThrough(new DecompressionStream("gzip")):s;'
+                'return new Response(d).json();});});}'
+                'window.__JT_FAST_ARCHIVE_PROMISE__=gunzipJson(fastUrl).then(function(pk){'
+                'var cols=pk.cols,dict=pk.dict,rows=pk.rows,pins=pk.cmaPins||{},n=rows.length,cl=cols.length,recs=new Array(n);'
+                'var iLoc=cols.indexOf("localImage"),iImg=cols.indexOf("imageUrl");'
+                'function dv(x){return typeof x==="string"&&x.charCodeAt(0)===1?dict[parseInt(x.slice(1),16)]:x;}'
+                'for(var i=0;i<n;i++){var rw=rows[i],rl=rw.length,o={};'
+                'for(var j=0;j<rl;j++){var v=rw[j];if(v===null)continue;'
+                'if(typeof v==="string"&&v.charCodeAt(0)===1)v=dict[parseInt(v.slice(1),16)];'
+                'else if(v===-1)v=iLoc>=0&&iLoc<rl?dv(rw[iLoc]):undefined;'
+                'else if(v===-2)v=iImg>=0&&iImg<rl?dv(rw[iImg]):undefined;'
+                'o[cols[j]]=v;}'
+                'if(o.localImage&&!o.imageUrl)o.imageUrl=o.localImage;'
+                'if(pins[i])o.sourceRecordSha256=pins[i];'
+                'recs[i]=o;}'
+                'var ad=pk.meta||{};ad.records=recs;'
+                'if(window.__jtSanitizePack)window.__jtSanitizePack(ad);'
+                'return ad;});'
+                'for(var k=0;k<p1Urls.length;k++)fetch(p1Urls[k]).catch(function(){});'
+                'var fullProm=null;'
+                'window.__jtEnsureFullCatalog=function(){'
+                'if(window.__JT_FULL_MERGED__)return Promise.resolve(true);'
+                'if(fullProm)return fullProm;'
+                'var bu=window.__JT_BASE_CATALOG_URL__||"./catalog-base.json.gz";'
+                'fullProm=gunzipJson(bu).then(function(full){'
+                'var cur=(window.ARCHIVE_DATA&&window.ARCHIVE_DATA.records)||[],fr=(full&&full.records)||[];'
+                'if(cur.length===fr.length){for(var i=0;i<fr.length;i++)Object.assign(cur[i],fr[i]);}'
+                'if(window.__jtSanitizePack)window.__jtSanitizePack(window.ARCHIVE_DATA);'
+                'window.__JT_FULL_MERGED__=true;return true;}).catch(function(){return false;});'
+                'return fullProm;};'
+                'window.__jtInstallDetailHydrator=function(){'
+                '["detail","exportRecords","copyCitation"].forEach(function(fn){'
+                'var orig=window[fn];if(typeof orig!=="function"||orig.__jtWrapped)return;'
+                'var w=async function(){var a=arguments;if(!window.__JT_FULL_MERGED__)await window.__jtEnsureFullCatalog();return orig.apply(this,a);};'
+                'w.__jtWrapped=true;window[fn]=w;});};'
+                '})();</script>'
+            )
+            txt = txt.replace(ZH_SHIM, ZH_SHIM + fast_tag, 1)
 
         # 2. SSG pre-render first-screen KPIs & initial 12 cards on index.html
         if hp == site_dir / "index.html" and ssg and ssg.get("total"):
@@ -886,8 +1524,9 @@ def optimize_zhonghua_site(site_dir: Path) -> dict:
             )
 
         # 3. Convert trailing synchronous <script src="..."> tags before </body> into #jt-zh-async-loader
-        m_existing = re.search(r'<script id="jt-zh-async-loader"[^>]*\bdata-all="([^"]+)"[^>]*>.*?</script>(?=\s*</body>)', txt, flags=re.S)
-        m_raw = None if m_existing else re.search(r'((?:<script\s+src="[^"]+"\s*></script>\s*)+)(?=</body>)', txt, flags=re.I)
+        is_shang_all = hp == site_dir / "shang-all.html"
+        m_existing = None if is_shang_all else re.search(r'<script id="jt-zh-async-loader"[^>]*\bdata-all="([^"]+)"[^>]*>.*?</script>(?=\s*</body>)', txt, flags=re.S)
+        m_raw = None if is_shang_all or m_existing else re.search(r'((?:<script\s+src="[^"]+"\s*></script>\s*)+)(?=</body>)', txt, flags=re.I)
         if m_existing or m_raw:
             if m_existing:
                 raw_srcs = json.loads(_html.unescape(m_existing.group(1)))
@@ -919,11 +1558,10 @@ def optimize_zhonghua_site(site_dir: Path) -> dict:
             check_html_js_syntax(hp)
             html_modified += 1
 
-    return {"js_modified": js_modified, "html_modified": html_modified, "ssg_records": ssg.get("total") if ssg else 0}
+    return {"js_modified": js_modified, "html_modified": html_modified, "ssg_records": ssg.get("total") if ssg else 0, "pruned_chunks": pruned_chunks, "fast_catalog_bytes": fast_cat["fast_bytes"] if fast_cat else 0}
 
 
 def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
-    git_prepare_repo(site_dir, auto_push)
     host = "zhonghua-civilization-atlas.fondcream1.chatgpt.site"
     try:
         with urllib.request.urlopen(urllib.request.Request(f"https://{host}/", headers={"User-Agent": UA}), timeout=15) as r_eff:
@@ -934,18 +1572,26 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
         pass
     base = f"https://{host}/"
 
-    # Quick probe on index.html + data.js + daily-batch.js + app.js
-    probe_files = ["index.html", "data.js", "daily-batch.js", "app.js", "song-data.js", "liao-data.js"]
+    # The catalog health probe below checks the new versioned gzip and scripts.
+    probe_files = ["index.html", "site-version.json", "data.js", "daily-batch.js", "app.js", "song-data.js", "liao-data.js"]
     probe_parts = []
+    index_bytes = b""
     for pf in probe_files:
         st_p, b_p = fetch_bytes(base + ("" if pf == "index.html" else pf))
-        if pf == "index.html" and st_p != 200:
+        if pf == "index.html" and (st_p != 200 or not b_p):
             return {"site": "zhonghua", "status": "upstream_skipped", "http": st_p}
         if st_p == 200:
             if pf.endswith(".html"):
                 b_p = strip_cf_challenge(b_p.decode("utf-8", "ignore")).encode("utf-8")
+                index_bytes = b_p
             probe_parts.append(sha256_bytes(b_p))
-    quick_fp = "|".join(probe_parts + [ZH_SHIM_REV])
+    catalog_refs, verified_loader, catalog_fp = probe_zhonghua_catalog_upstream(base, index_bytes)
+    new_catalog_declared = bool(verified_loader)
+    catalog_base_rel = zh_catalog_loader_dependencies(verified_loader["catalog-loader.js"].decode("utf-8"))[0] if new_catalog_declared else None
+    # Keep the local mirror current with cloud commits even when this upstream
+    # snapshot is unchanged; a broken origin never reaches this Git operation.
+    git_prepare_repo(site_dir, auto_push)
+    quick_fp = "|".join(probe_parts + [catalog_fp, ZH_SHIM_REV, shang_all_input_fingerprint(site_dir) if new_catalog_declared else "legacy"])
 
     state_p = site_dir / ".sync_state.json"
     required_aux = (
@@ -955,14 +1601,27 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
     if state_p.is_file() and required_aux:
         try:
             if json.loads(state_p.read_text(encoding="utf-8")).get("quick_fp") == quick_fp:
-                return {"site": "zhonghua", "status": "up-to-date"}
+                if not new_catalog_declared:
+                    return {"site": "zhonghua", "status": "up-to-date"}
+                loader_bytes = verified_loader.get("catalog-loader.js")
+                if loader_bytes:
+                    base_rel, scripts = zh_catalog_loader_dependencies(loader_bytes.decode("utf-8"))
+                    if (all((site_dir / rel).is_file() and (site_dir / rel).stat().st_size for rel in ["catalog-loader.js", base_rel, *scripts])
+                            and shang_all_snapshot_ready(site_dir) and shang_all_index_ready(site_dir)):
+                        return {"site": "zhonghua", "status": "up-to-date"}
         except Exception:
             pass
 
+    # The quick pass reads only the small loader and response headers. Download
+    # and hash large catalog chunks only when a new snapshot is actually needed.
+    verified_catalog = verify_zhonghua_catalog_upstream(base, catalog_refs, verified_loader)
+
     text_exts = {".html", ".css", ".js", ".json", ".md", ".svg", ".txt"}
     asset_exts = {".webp", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico", ".woff", ".woff2"}
-    to_visit = {"index.html", "site-version.json", "publication-proofs/build-report.json"}
+    to_visit = {"index.html", "site-version.json", "publication-proofs/build-report.json", *verified_catalog}
     visited = set()
+    fetched = set()
+    catalog_loader_source = None
     discovered_media = set()
     gate_tag = make_gate_script("金泰 AI · 中华文明影像库")
 
@@ -971,6 +1630,10 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
         if not batch:
             break
         def dl_doc(rel):
+            if rel == "index.html":
+                return rel, 200, index_bytes
+            if rel in verified_catalog:
+                return rel, 200, verified_catalog[rel]
             u = base + ("" if rel == "index.html" else urllib.parse.quote(rel, safe="/"))
             s, b = fetch_bytes(u, retries=3, timeout=30)
             return rel, s, b
@@ -980,8 +1643,9 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
             visited.add(rel)
             if s != 200 or not b:
                 continue
+            fetched.add(rel)
             ext = os.path.splitext(rel)[1].lower()
-            txt = b.decode("utf-8", errors="ignore")
+            txt = "" if ext == ".gz" else b.decode("utf-8", errors="ignore")
             if ext == ".html":
                 clean_h = strip_cf_challenge(txt)
                 clean_h = re.sub(r'<style>a\[href\*="signin-with-chatgpt"\][^<]*</style>', '', clean_h, flags=re.S)
@@ -1023,12 +1687,19 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
                     lp.parent.mkdir(parents=True, exist_ok=True)
                     if not lp.is_file() or lp.read_bytes() != b_opt:
                         lp.write_bytes(b_opt)
+                if rel == catalog_base_rel:
+                    discovered_media.update(discover_zh_catalog_media(b))
                 if ext == ".css":
                     for ref in re.findall(r'url\(["\']?([^"\')]+)["\']?\)', txt, flags=re.I):
                         nr = norm_zh_rel(rel, ref)
                         if nr:
                             discovered_media.add(nr)
                 elif ext in (".js", ".json"):
+                    if rel == "catalog-loader.js":
+                        catalog_loader_source = txt
+                        catalog_base, catalog_scripts = zh_catalog_loader_dependencies(txt)
+                        to_visit.add(catalog_base)
+                        to_visit.update(catalog_scripts)
                     for m in re.finditer(r'["\'`]((?:\./)?(?:assets|(?:[A-Za-z0-9_-]+-)?images|research-[A-Za-z0-9_-]+)/[^"\'`\s?#]+|(?:[A-Za-z0-9_-]+\.html))(?:\?[^"\'`\s#]*)?["\'`]', txt):
                         nr = norm_zh_rel(rel, m.group(1))
                         if nr:
@@ -1037,6 +1708,11 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
                                 to_visit.add(nr)
                             elif rext in asset_exts:
                                 discovered_media.add(nr)
+
+    if new_catalog_declared:
+        if catalog_loader_source is None:
+            raise RuntimeError("upstream declares catalog-loader.js, but it was not fetched")
+        validate_zh_catalog_downloads(site_dir, catalog_loader_source, fetched)
 
     prev_unhosted = set()
     if state_p.is_file():
@@ -1087,6 +1763,9 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
         with concurrent.futures.ThreadPoolExecutor(max_workers=24) as ex:
             list(ex.map(dl_media, missing_media))
 
+    if new_catalog_declared:
+        build_shang_all_snapshot(site_dir, site_dir / catalog_base_rel)
+
     # Align <meta name="atlas-snapshot-revision"> in all synced HTML pages with site-version.json so freshly opened tabs never enter a false update-banner loop
     sv_path = site_dir / "site-version.json"
     if sv_path.is_file():
@@ -1094,7 +1773,7 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
             sv_rev = json.loads(sv_path.read_text(encoding="utf-8")).get("revision", "")
             if re.fullmatch(r"[0-9a-f]{64}", sv_rev):
                 for hp in site_dir.rglob("*.html"):
-                    if ".git" in hp.parts:
+                    if ".git" in hp.parts or hp == site_dir / "scripts" / "shang_all.template.html":
                         continue
                     htxt = hp.read_text(encoding="utf-8", errors="ignore")
                     hnew = re.sub(
@@ -1107,19 +1786,63 @@ def sync_zhonghua(site_dir: Path, auto_push: bool = True) -> dict:
         except Exception:
             pass
 
-    optimize_zhonghua_site(site_dir)
+    optimized = optimize_zhonghua_site(site_dir)
+    if new_catalog_declared and not optimized["ssg_records"]:
+        raise RuntimeError("new zhonghua catalog could not be parsed for first-screen rendering")
     all_unhosted = sorted((prev_unhosted | newly_unhosted) - {m for m in discovered_media if (site_dir / m).is_file()})
     state_p.write_text(json.dumps({"quick_fp": quick_fp, "docs": len(visited), "new_media": len(missing_media) - len(newly_unhosted), "unhosted_media": all_unhosted}, indent=2), encoding="utf-8")
     changed = git_push_if_changed(site_dir, "zhonghua-civilization-atlas", f"sync(auto): upstream zhonghua atlas ({len(visited)} docs)", auto_push)
     return {"site": "zhonghua", "status": "updated" if changed else "up-to-date", "changed_files": len(changed), "new_media": len(missing_media)}
 
 
-def sync_history_site1() -> dict:
+def sync_history_site1(auto_push: bool = True) -> dict:
     hist_mgr = Path(r"C:\Users\KingT\jintai-internal\中国历史文化图库\每日更新\管理\ensure_domestic_compact_index.py")
     cat_sync = Path(r"C:\Users\KingT\jintai-internal\中国历史文化图库\每日更新\管理\sync_all_category_pages.py")
     pub = Path(r"C:\Users\KingT\jintai-internal\中国历史文化图库\每日更新\publish_checkout_20261012")
     if not hist_mgr.is_file() or not pub.is_dir():
         return {"site": "history", "status": "skipped_not_local"}
+
+    # The remote branch can advance while this partial clone's local HEAD stays
+    # behind. Check before generating pages or staging objects; the publisher
+    # cannot safely push across that divergence. Keep the other sites running.
+    probe_env = os.environ.copy()
+    probe_env["GIT_NO_LAZY_FETCH"] = "1"
+
+    def probe_git(*args: str) -> str:
+        command = ["git", "--no-lazy-fetch", "-C", str(pub), *args]
+        proc = subprocess.Popen(
+            command, env=probe_env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=25)
+        except subprocess.TimeoutExpired:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, timeout=10, check=False,
+                )
+            except subprocess.TimeoutExpired:
+                pass
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
+            raise RuntimeError("history remote-head probe timed out")
+        if proc.returncode:
+            raise subprocess.CalledProcessError(
+                proc.returncode, command, output=stdout, stderr=stderr,
+            )
+        return stdout.decode("utf-8", errors="replace").strip()
+
+    try:
+        local_head = probe_git("rev-parse", "HEAD")
+        remote_line = probe_git("ls-remote", "--heads", "origin", "main")
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        return {"site": "history", "status": "blocked_remote_check", "reason": type(exc).__name__}
+    remote_head = remote_line.split("\t", 1)[0] if remote_line else ""
+    if remote_head != local_head:
+        return {"site": "history", "status": "blocked_remote_diverged", "local_head": local_head, "remote_head": remote_head}
+
     sync_ext = hist_mgr.parent / "sync_external_and_verify.py"
     subprocess.run([sys.executable, str(sync_ext)], check=True)
     tracked_targets = [
@@ -1132,13 +1855,8 @@ def sync_history_site1() -> dict:
         "更新记录.html", "changelog.html", "00_每日更新总目录.html", "每日更新/00_每日更新总目录.html",
     ]
     existing_targets = [t for t in tracked_targets if (pub / t).exists()]
-    st = subprocess.run(["git", "-C", str(pub), "status", "--porcelain", "--"] + existing_targets, capture_output=True, text=True)
-    if st.stdout.strip():
-        subprocess.run(["git", "-C", str(pub), "add", "--"] + existing_targets, check=True)
-        subprocess.run(["git", "-C", str(pub), "commit", "-m", "sync(auto): refresh domestic compact index, specialist category pages & WeChat gate"], check=True)
-        subprocess.run(["git", "-C", str(pub), "push", "origin", "HEAD:main"], check=True, timeout=240)
-        return {"site": "history", "status": "updated"}
-    return {"site": "history", "status": "up-to-date"}
+    result = _history_publish_selected(pub, existing_targets, auto_push=auto_push)
+    return {"site": "history", **result}
 
 
 def collect_live_4sites_metrics(root: Path) -> dict:
@@ -1532,6 +2250,28 @@ def sync_portal_and_hbcm_metrics(root: Path, auto_push: bool = True) -> dict:
                 {"name": "🎚️ 声仓首页与使用指南", "meta": "波形预览与下载", "cloud": "https://aikingtai-ctrl.github.io/shengcang-sound-library/", "local": "/shengcang-sound-library/"},
             ],
         },
+        {
+            "key": "story2board",
+            "fullWidth": True,
+            "title": "5. 金泰 Story2Board · AI 分镜副导演与影史分镜工作台（公开免密直达）",
+            "tags": [
+                [f"250 部影史名片蒸馏 · 58,610 精标母镜 · 关联 {m['film_works']:,} 部 / {m['film_shots']:,} 镜", ""],
+                ["AI 副导演拆镜配镜 · 锁脸提示词包 · 20pt 大字场记单", ""],
+                ["公开免密直达 · 离线+隧道实时双模", "red"],
+            ],
+            "desc": (
+                f"内置双预设 8×H100 实渲电影分镜示例（《雨夜霓虹》《长安暮雪》），支持 250 部影史名片离线秒搜与隧道直连 58,610 条精标母镜"
+                f"（关联《影视参考图集》{m['film_works']:,} 部 / {m['film_shots']:,} 镜）、输入故事自动拆镜提供 3 套影史大师机位方案与运镜动机、"
+                "一键复制锁脸提示词包及 20pt 大字场记单打印直出。"
+            ),
+            "cloudUrl": "https://aikingtai-ctrl.github.io/jintai-story2board/",
+            "localPath": "/jintai-story2board/",
+            "catTitle": "工作台核心模式与直达入口：",
+            "categories": [
+                {"name": "🎥 AI 副导演工作台", "meta": "剧本拆镜 · 3 套大师机位", "cloud": "https://aikingtai-ctrl.github.io/jintai-story2board/", "local": "/jintai-story2board/"},
+                {"name": "📚 影史分镜索引库", "meta": f"250 名片 · {film_wan1}万全库", "cloud": "https://aikingtai-ctrl.github.io/jintai-story2board/#index", "local": "/jintai-story2board/#index"},
+            ],
+        },
     ]
 
     p_idx = portal_dir / "index.html"
@@ -1541,11 +2281,12 @@ def sync_portal_and_hbcm_metrics(root: Path, auto_push: bool = True) -> dict:
         f'· 影视参考库（{m["film_works"]:,} 部 / {m["film_shots"]:,} 镜 / {m["film_styles"]} 大流派）'
         f'· 声仓（{m["sc_total"]:,} 条声效 / {m["sc_cats"]} 大类）'
         f'· 纪录片教学库（{m["doc_published"]:,} 部已发布 / {m["doc_total"]:,} 总目）'
-        f'· 中华文明影像库（12 断代专卷 / {m["zh_records"]:,} 条馆藏考证）。</p>'
+        f'· 中华文明影像库（12 断代专卷 / {m["zh_records"]:,} 条馆藏考证）'
+        f'· Story2Board AI 分镜工作台（250 名片 / 58,610 精标母镜）。</p>'
     )
     sites_js = "  var SITES = " + json.dumps(sites_data, ensure_ascii=False, indent=4) + ";"
     pt = re.sub(r'<p class="lead">.*?</p>', new_lead, orig_pt, count=1, flags=re.S)
-    pt = re.sub(r"  var SITES = \[.*?\n  \];", lambda _: sites_js, pt, count=1, flags=re.S)
+    pt = re.sub(r"  var SITES = \[.*?\n\s*\];", lambda _: sites_js, pt, count=1, flags=re.S)
     if pt != orig_pt:
         today_s = time.strftime("%Y-%m-%d")
         pt = re.sub(r"四站全分类网页实时同步（\d{4}-\d{2}-\d{2}）", f"四站全分类网页实时同步（{today_s}）", pt, count=1)
@@ -1629,7 +2370,12 @@ def main():
 
     results = []
     if args.only in ("all", "history") and not args.repo_dir:
-        results.append(sync_history_site1())
+        # A partial-clone diff can lazily download multi-GB Git packs. Keep the
+        # other site mirrors live while disk-space recovery is in progress.
+        if (root / ".pause_history_sync").is_file():
+            results.append({"site": "history", "status": "paused_low_disk"})
+        else:
+            results.append(sync_history_site1(auto_push=auto_push))
     if args.only in ("all", "shengcang"):
         d = Path(args.repo_dir) if args.repo_dir else (root / "01_shengcang-sound-library")
         results.append(sync_shengcang(d, auto_push=auto_push))
