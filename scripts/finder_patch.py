@@ -2,6 +2,7 @@
 """Apply the sound-finding UI & mirror audio fallback to every upstream refresh (Rollup + Rolldown compatible)."""
 from __future__ import annotations
 
+import html as html_mod
 import json
 import re
 import subprocess
@@ -24,6 +25,13 @@ CATEGORIES = [
     ("音乐与配乐", "音乐", "古风 · 舒缓 · 史诗"),
 ]
 ORIGIN = "https://shengcang-sound-library.jeaess66.chatgpt.site"
+BLANK_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+ARROW_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" '
+    'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+    'stroke-linejoin="round" class="lucide lucide-arrow-up-right" aria-hidden="true">'
+    '<path d="M7 7h10v10"></path><path d="M7 17 17 7"></path></svg>'
+)
 
 
 def sub_once(source: str, pattern: str, repl, name: str, flags: int = 0) -> str:
@@ -60,25 +68,68 @@ def collect_missing_audio(site: Path) -> list[str]:
     return sorted(missing)
 
 
-def patch_bundle(source: str, missing_audio: list[str]) -> str:
+def _cards_js_literal() -> str:
+    return ",".join(
+        "{name:`%s`,english:`SOUND`,category:`%s`,categories:[`%s`],image:`cat-%02d`,theme:`mint`,note:`%s`}"
+        % (name, category, category, idx, note)
+        for idx, (name, category, note) in enumerate(CATEGORIES)
+    )
+
+
+def _upgrade_shared_bundle_fixes(source: str) -> str:
+    cards_items = _cards_js_literal()
+    if "image:`nature`,theme:`mint`" in source:
+        source = sub_once(
+            source,
+            r"([A-Za-z_$][\w$]*)=\[\{name:`环境与天气`,english:`SOUND`.*?\}\](?=[,;])",
+            lambda m: f"{m.group(1)}=[{cards_items}]",
+            "upgrade 12 compact category cards unique keys",
+            flags=re.S,
+        )
+    if "className:`collection-art`" in source and BLANK_GIF not in source:
+        source = sub_once(
+            source,
+            r'className:`collection-art`,src:`(?:\.)?/images/\$\{[A-Za-z_$][\w$]*\.image\}\.png`,alt:``,width:1280,height:1280,fetchPriority:[A-Za-z_$][\w$]*\.theme===`featured`\?`high`:`auto`',
+            lambda _: f'className:`collection-art`,src:`{BLANK_GIF}`,alt:``,width:1280,height:1280,fetchPriority:`auto`',
+            "neutralize hidden collection-art png fetch",
+        )
+    if ".toLocaleString(),` `" in source:
+        source = sub_once(
+            source,
+            r"([A-Za-z_$][\w$]*)\.toLocaleString\(\),` `,([A-Za-z_$][\w$]*)\.category===`音乐`\?`段配乐`:`条声音`",
+            lambda m: f'{m.group(1)}.toLocaleString(`en-US`),` `,{m.group(2)}.category===`音乐`?`段配乐`:`条声音`',
+            "pin en-US locale for SSR hydration parity",
+        )
+    return source
+
+
+def _audio_helper_js(missing_audio: list[str]) -> str:
     missing_set = "var jtMissingAudio=new Set(" + json.dumps(
         missing_audio, ensure_ascii=False, separators=(",", ":")
     ) + ");\n"
-    if "function jtAudioSrc(" in source:
-        return sub_once(
-            source,
-            r"var jtMissingAudio=new Set\(\[[^\n]*\]\);\n",
-            lambda _: missing_set,
-            "update jtMissingAudio",
-        )
-
-    audio_helper = (
+    return (
         missing_set
         + f"function jtAudioSrc(e){{if(typeof e!==`string`)return e;"
         + f"if(e.startsWith(`/api/audio/`))return`{ORIGIN}`+e;"
         + f"let t=e.match(/(?:^|\\/)audio\\/([^?#]+)/);"
-        + f"return t&&jtMissingAudio.has(t[1])?`{ORIGIN}/audio/`+t[1]:e}}\n"
+        + f"if(!t)return e;"
+        + f"if(jtMissingAudio.has(t[1]))return`{ORIGIN}/audio/`+t[1];"
+        + f"let b=typeof window!==`undefined`&&window.__JT_BASE__||`/`;"
+        + f"return b+`audio/`+t[1]}}\n"
     )
+
+
+def patch_bundle(source: str, missing_audio: list[str]) -> str:
+    audio_helper = _audio_helper_js(missing_audio)
+    if "function jtAudioSrc(" in source:
+        source = sub_once(
+            source,
+            r"var jtMissingAudio=new Set\(\[[^\n]*\]\);\nfunction jtAudioSrc\(e\)\{[^\n]*\}\n",
+            lambda _: audio_helper,
+            "update jtMissingAudio + canonical jtAudioSrc",
+        )
+        return _upgrade_shared_bundle_fixes(source)
+
     source = sub_once(
         source,
         r"^((?:import[^;]+;)+)",
@@ -86,11 +137,7 @@ def patch_bundle(source: str, missing_audio: list[str]) -> str:
         "inject jtAudioSrc after imports",
     )
 
-    cards_items = ",".join(
-        "{name:`%s`,english:`SOUND`,category:`%s`,categories:[`%s`],image:`nature`,theme:`mint`,note:`%s`}"
-        % (name, category, category, note)
-        for name, category, note in CATEGORIES
-    )
+    cards_items = _cards_js_literal()
     source = sub_once(
         source,
         r"([A-Za-z_$][\w$]*)=\[\{name:`环境氛围`,english:`AMBIENCE`.*?\}\](?=[,;])",
@@ -142,7 +189,65 @@ def patch_bundle(source: str, missing_audio: list[str]) -> str:
         ),
         "catalogue detail modal",
     )
-    return source
+    return _upgrade_shared_bundle_fixes(source)
+
+
+def build_ssr_collection_grid(html: str) -> str:
+    m_counts = re.search(r'\\"categoryCounts\\":(\{[^}]+\})', html)
+    if m_counts:
+        raw_json = m_counts.group(1).replace('\\"', '"')
+        counts = json.loads(raw_json)
+    else:
+        m_plain = re.search(r'"categoryCounts":(\{[^}]+\})', html)
+        counts = json.loads(m_plain.group(1)) if m_plain else {}
+
+    buttons: list[str] = []
+    for name, category, note in CATEGORIES:
+        cnt = int(counts.get(category, 0))
+        unit = "段配乐" if category == "音乐" else "条声音"
+        esc_name = html_mod.escape(name, quote=True)
+        esc_note = html_mod.escape(note, quote=True)
+        buttons.append(
+            f'<button class="collection-card mint" aria-label="浏览{esc_name}，{cnt}条声音" aria-pressed="false">'
+            f'<img class="collection-art" src="{BLANK_GIF}" alt="" width="1280" height="1280" fetchPriority="auto"/>'
+            f'<span class="collection-copy">'
+            f'<span class="collection-english">SOUND</span>'
+            f'<strong>{esc_name}</strong>'
+            f'<span class="collection-note">{esc_note}</span>'
+            f'<span class="collection-bottom">'
+            f'<span>{cnt:,}<!-- --> <!-- -->{unit}</span>'
+            f'{ARROW_SVG}'
+            f'</span></span></button>'
+        )
+    return f'<div class="collection-grid" aria-label="探索声音分类">{"".join(buttons)}</div>'
+
+
+def build_ssr_category_select(html: str) -> str:
+    init_by_cat: dict[str, int] = {}
+    init_total = 0
+    m_sounds = re.search(r'\\"sounds\\":(\[\{.*?\}\])\}\]\\n"\)', html)
+    if m_sounds:
+        sounds = json.loads(m_sounds.group(1).replace('\\"', '"').replace('\\\\', '\\'))
+        init_total = len(sounds)
+        for item in sounds:
+            cat = item.get("category")
+            if isinstance(cat, str):
+                init_by_cat[cat] = init_by_cat.get(cat, 0) + 1
+    else:
+        m_sel = re.search(r'<select aria-label="声音分类">(.*?)</select>', html, flags=re.S)
+        if m_sel:
+            for val, num in re.findall(r'<option value="([^"]+)"[^>]*>.*?<!-- -->(\d+)<!-- -->', m_sel.group(1)):
+                if val == "全部声音":
+                    init_total = int(num)
+                else:
+                    init_by_cat[val] = int(num)
+    opts = [f'<option value="全部声音" selected="">全部声音（<!-- -->{init_total}<!-- -->）</option>']
+    for name, category, _ in CATEGORIES:
+        c = init_by_cat.get(category, 0)
+        esc_cat = html_mod.escape(category, quote=True)
+        esc_name = html_mod.escape(name, quote=True)
+        opts.append(f'<option value="{esc_cat}">{esc_name}<!-- -->（<!-- -->{c}<!-- -->）</option>')
+    return f'<select aria-label="声音分类">{"".join(opts)}</select>'
 
 
 STYLE = """
@@ -209,6 +314,22 @@ def patch(site: Path) -> None:
 
     index = site / "index.html"
     html = index.read_text(encoding="utf-8")
+    ssr_grid = build_ssr_collection_grid(html)
+    html = sub_once(
+        html,
+        r'<div class="collection-grid" aria-label="探索声音分类">.*?</div>(?=</details>)',
+        lambda _: ssr_grid,
+        "sync SSR collection-grid for hydration parity",
+        flags=re.S,
+    )
+    ssr_select = build_ssr_category_select(html)
+    html = sub_once(
+        html,
+        r'<select aria-label="声音分类">.*?</select>',
+        lambda _: ssr_select,
+        "sync SSR category select for hydration parity",
+        flags=re.S,
+    )
     if 'id="sc-finder-v2"' in html:
         html = sub_once(html, r'<style id="sc-finder-v2">.*?</style>', lambda _: STYLE.strip(), "update sc-finder-v2 style", flags=re.S)
     else:
